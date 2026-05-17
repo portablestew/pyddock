@@ -1,0 +1,27 @@
+[project]
+name = "pyddock"
+version = "0.1.0"
+description = "MCP server exposing a policy-controlled run_python tool"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp",
+]
+
+[project.scripts]
+pyddock = "pyddock.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyddock"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "hypothesis",
+]
