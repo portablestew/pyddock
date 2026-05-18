@@ -6,9 +6,20 @@ MCP server that gives AI agents pre-approved `run_python`, `run_shell`, and file
 
 ## Why
 
-Agents write shell snippets for structured tasks. Those snippets require user approval (workflow friction) or blind trust (security risk). Built-in permission management forces a choice: pause for every command, or trust everything. pyddock walks the line between safety and workflow efficiency by providing Python execution and shell command access with policy controls that make it safe to auto-approve.
+Agents write shell snippets for structured tasks. Those snippets require user approval (workflow friction) or blind trust (security risk). Common alternatives each have limitations:
 
-**Intended use:** Efficient, trusted shell replacement for unattended agents in development environments. Pyddock allows free-form scripting on the fly without enabling "trust all" options. When a snippet hits a policy boundary, the error message tells the agent what to use instead — permission failures guide adaptation rather than blocking progress.
+- **Trust specific command strings.** Agents produce variations or chain commands into ad-hoc scripts that break naive string matching, causing repeated approval prompts for equivalent operations.
+- **Trust all shell execution.** Unsafe when the environment has access to production resources.
+- **Full containerized sandbox (Docker).** Isolation cuts agents off from the dev workspace, host network, and local tooling. Restoring access requires per-project configuration that is brittle to maintain.
+- **Larger agent framework with granular permissions.** High adoption cost for what should be a drop-in tool.
+
+pyddock provides Python execution and shell command access with declarative policy controls. Policies are safe to auto-approve because side effects are scoped to the configured workspace.
+
+**Intended use:** Trusted shell replacement for unattended agents in development environments. The full permission policy is reported in the MCP tool description, so agents know what is allowed before writing code. When a snippet does violate a policy, the error includes the specific rule and a recommended workaround. Agents adapt non-interactively rather than blocking on human approval.
+
+**Replaces dedicated MCP servers:** A full Python environment means agents can call service APIs directly (boto3, p4python, etc.) under the same policy enforcement. This eliminates the need for separate MCP servers for AWS, Atlassian, Perforce, and similar services, and allows agents to compose multiple API calls in a single `run_python` invocation.
+
+**Workspace scripts:** Scripts in a configured directory (e.g. `.kiro/scripts/`) are automatically trusted. Scripts authored for workspace agents require no additional pyddock configuration.
 
 **Threat model:** Pyddock's guardrails keep *trustworthy local agents* out of trouble. A determined adversary may discover a jailbreak, or chain with other tools in the workspace for escalation and/or exfiltration. The Python sandbox contains extensive anti-jailbreak protections, but only as a first-line of defense against accidents and casual misuse. Pyddock does not claim to be a security boundary against targeted exploitation or public abuse. In other words, life finds a way.
 

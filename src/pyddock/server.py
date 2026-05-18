@@ -256,6 +256,7 @@ def create_server(workspace: Path | None = None) -> FastMCP:
     _read_file_desc = (
         "Read a text file. Approximately: Path(path).read_text().splitlines()[start:end]\n"
         "\n"
+        "Output is line-numbered (e.g. '  1| first line').\n"
         "Lines are 1-indexed, inclusive. Use negative start to tail the file (start=-20 = last 20 lines).\n"
         "When start is negative, end is ignored (tail always reads to end of file).\n"
         "Omit start/end for the whole file. Fails on binary/non-UTF-8 files."
