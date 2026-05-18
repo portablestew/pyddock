@@ -38,11 +38,20 @@ class ImportsConfig:
 
 
 @dataclass
+class GuardRule:
+    """A single filesystem guard rule (regex → disposition)."""
+
+    pattern: str  # regex pattern matched against resolved path (forward slashes)
+    disposition: str  # "deny", "workspace", or "allow"
+
+
+@dataclass
 class FilesystemConfig:
     """Filesystem scoping configuration."""
 
     writable_paths: list[str] = field(default_factory=lambda: ["."])
     readable_paths: list[str] = field(default_factory=lambda: ["."])
+    guards: list[GuardRule] = field(default_factory=list)
 
 
 @dataclass
@@ -155,7 +164,27 @@ def _parse_filesystem(data: dict) -> FilesystemConfig:
         raise ConfigError("[filesystem].writable_paths must be a list of strings")
     if not isinstance(readable, list) or not all(isinstance(s, str) for s in readable):
         raise ConfigError("[filesystem].readable_paths must be a list of strings")
-    return FilesystemConfig(writable_paths=writable, readable_paths=readable)
+
+    # Parse [filesystem.guards] — ordered table of regex → disposition
+    guards_section = section.get("guards", {})
+    if not isinstance(guards_section, dict):
+        raise ConfigError("[filesystem.guards] must be a table")
+    guards: list[GuardRule] = []
+    _valid_dispositions = ("deny", "workspace", "allow")
+    for pattern, disposition in guards_section.items():
+        if not isinstance(disposition, str):
+            raise ConfigError(
+                f"[filesystem.guards].'{pattern}' must be a string "
+                f"('deny', 'workspace', or 'allow'), got {type(disposition).__name__}"
+            )
+        if disposition not in _valid_dispositions:
+            raise ConfigError(
+                f"[filesystem.guards].'{pattern}' must be 'deny', 'workspace', "
+                f"or 'allow', got '{disposition}'"
+            )
+        guards.append(GuardRule(pattern=pattern, disposition=disposition))
+
+    return FilesystemConfig(writable_paths=writable, readable_paths=readable, guards=guards)
 
 
 def _parse_ast(data: dict) -> ASTConfig:

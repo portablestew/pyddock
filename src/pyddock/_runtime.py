@@ -1034,6 +1034,57 @@ class RuntimeEnforcement:
                         _abspath(workspace_root / clean_dir)
                     )
 
+        # Compile filesystem guards (regex → disposition, first match wins).
+        # Guards apply to BOTH reads and writes.
+        guards_config = fs_config.get("guards", [])
+        compiled_guards: list[tuple[re.Pattern[str], str]] = []
+        for guard in guards_config:
+            pattern_str = guard.get("pattern", "") if isinstance(guard, dict) else ""
+            disposition = guard.get("disposition", "deny") if isinstance(guard, dict) else "deny"
+            try:
+                compiled_guards.append((re.compile(pattern_str), disposition))
+            except re.error:
+                pass  # Skip invalid patterns silently (logged at config load time)
+
+        _workspace_root_abs = _abspath(workspace_root)
+
+        def _check_guard(path: pathlib.Path, operation: str) -> bool | None:
+            """Check path against filesystem guards. Returns:
+            - True if access is explicitly allowed
+            - False (raises) if access is denied
+            - None if no guard matched (fall through to normal logic)
+
+            Args:
+                path: The resolved absolute path to check.
+                operation: "read" or "write" (for error messages).
+            """
+            # Normalize to forward slashes for cross-platform regex matching
+            path_str = str(path).replace("\\", "/")
+
+            for pattern, disposition in compiled_guards:
+                if pattern.search(path_str):
+                    if disposition == "deny":
+                        raise PermissionError(
+                            f"PermissionError: Cannot {operation} '{path}' — "
+                            f"path matches a filesystem guard (pattern: "
+                            f"'{pattern.pattern}', disposition: deny). "
+                            f"This path is blocked for security."
+                        )
+                    elif disposition == "workspace":
+                        try:
+                            path.relative_to(_workspace_root_abs)
+                            return True  # inside workspace — allowed
+                        except ValueError:
+                            raise PermissionError(
+                                f"PermissionError: Cannot {operation} '{path}' — "
+                                f"path matches a filesystem guard (pattern: "
+                                f"'{pattern.pattern}', disposition: workspace). "
+                                f"This path is only accessible inside the workspace."
+                            )
+                    elif disposition == "allow":
+                        return True  # explicitly allowed
+            return None  # no guard matched
+
         def _is_within(target: pathlib.Path, allowed_roots: list[pathlib.Path]) -> bool:
             """Check if target path is within any of the allowed roots."""
             resolved_target = _abspath(target)
@@ -1061,9 +1112,15 @@ class RuntimeEnforcement:
 
         def _check_read(path: pathlib.Path) -> None:
             """Raise PermissionError if path is outside readable scope."""
+            resolved = _abspath(path)
+            # Check guards first (first match wins)
+            guard_result = _check_guard(resolved, "read")
+            if guard_result is True:
+                return  # explicitly allowed by guard
+            # guard_result is None — no guard matched, fall through
             if unrestricted_reads:
                 return
-            if not _is_within(path, resolved_readable):
+            if not _is_within(resolved, resolved_readable):
                 paths_str = ", ".join(str(p) for p in resolved_readable)
                 raise PermissionError(
                     f"PermissionError: Cannot read '{path}' — reads are restricted "
@@ -1073,6 +1130,14 @@ class RuntimeEnforcement:
 
         def _check_write(path: pathlib.Path) -> None:
             """Raise PermissionError if path is outside writable scope."""
+            resolved = _abspath(path)
+            # Check guards first (first match wins)
+            guard_result = _check_guard(resolved, "write")
+            # Even if guard says "allow", still enforce structural protections
+            # (.pyddock/, pyddock source, stdlib, workspace modules, shell dirs).
+            # Guards can only DENY or relax the writable_paths boundary — they
+            # cannot override structural write protections.
+
             if _is_pyddock_path(path):
                 raise PermissionError(
                     f"PermissionError: Cannot write to '{path}' — the .pyddock/ "
@@ -1080,9 +1145,8 @@ class RuntimeEnforcement:
                     f"configuration or environment."
                 )
             # Protect pyddock's own source directory (enforcement code)
-            resolved_target = _abspath(path)
             try:
-                resolved_target.relative_to(pathlib.Path(_PYDDOCK_DIR))
+                resolved.relative_to(pathlib.Path(_PYDDOCK_DIR))
                 raise PermissionError(
                     f"PermissionError: Cannot write to '{path}' — the pyddock "
                     f"source directory is protected."
@@ -1091,7 +1155,7 @@ class RuntimeEnforcement:
                 pass
             # Protect the Python stdlib Lib directory
             try:
-                resolved_target.relative_to(_stdlib_lib_path)
+                resolved.relative_to(_stdlib_lib_path)
                 raise PermissionError(
                     f"PermissionError: Cannot write to '{path}' — the Python "
                     f"standard library directory is protected."
@@ -1101,7 +1165,7 @@ class RuntimeEnforcement:
             # Check workspace module directory protection
             for ws_dir in workspace_module_dirs:
                 try:
-                    resolved_target.relative_to(ws_dir)
+                    resolved.relative_to(ws_dir)
                     raise PermissionError(
                         f"Cannot write to '{path}' — workspace module "
                         f"directories are protected."
@@ -1111,7 +1175,7 @@ class RuntimeEnforcement:
             # Check shell write protection (prevent write-then-execute escalation)
             for protected_dir in shell_protected_dirs:
                 try:
-                    resolved_target.relative_to(protected_dir)
+                    resolved.relative_to(protected_dir)
                     raise PermissionError(
                         f"PermissionError: Cannot write to '{path}' — this path "
                         f"is write-protected because it contains shell-executable "
@@ -1119,7 +1183,12 @@ class RuntimeEnforcement:
                     )
                 except ValueError:
                     continue
-            if not _is_within(path, resolved_writable):
+
+            # If guard explicitly allowed, skip writable_paths boundary check
+            if guard_result is True:
+                return
+
+            if not _is_within(resolved, resolved_writable):
                 paths_str = ", ".join(str(p) for p in resolved_writable)
                 raise PermissionError(
                     f"PermissionError: Cannot write '{path}' — writes are restricted "

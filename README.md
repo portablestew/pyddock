@@ -105,7 +105,9 @@ Pyddock also exposes file I/O tools that execute through the same sandbox as `ru
 - **Write protection** — path-like shell command regexes automatically generate write-deny rules for `run_python`, preventing write-then-execute privilege escalation
 - **subprocess proxy** — `run_python` code has access to `subprocess.run()` and `subprocess.Popen()`, both validated against the same shell policies; `shell=True` and string commands are always rejected; `os.system()` is blocked
 
-Writes are restricted to the workspace. The `.pyddock/` directory, pyddock source, and the Python stdlib directory are always write-protected (`.pyddock/tmp/` is the exception, used by tempfile). Reads are unrestricted by default.
+Writes are restricted to the workspace. The `.pyddock/` directory, pyddock source, and the Python stdlib directory are always write-protected (`.pyddock/tmp/` is the exception, used by tempfile). Reads are unrestricted by default but subject to filesystem guards.
+
+**Filesystem guards** (`[filesystem.guards]`) provide regex-based path rules that apply to both reads and writes. Each pattern maps to a disposition: `"deny"` (block unconditionally), `"workspace"` (allow only inside the workspace), or `"allow"` (permit unconditionally). First match listed in the toml wins. Assorted secrets are blocked by default (`~/.ssh/`, `~/.aws/credentials`, `~/.gnupg/`, etc.). `.env` files are restricted to workspace-only access.
 
 ## Configuration
 
@@ -136,6 +138,11 @@ boto3 = true
 [filesystem]
 writable_paths = ["."]   # "." = workspace directory; "*" = unrestricted
 readable_paths = ["*"]
+
+[filesystem.guards]      # regex → disposition (first match wins)
+"/\\.ssh/" = "deny"
+"/\\.aws/credentials$" = "deny"
+"/\\.env(\\.[^/]*)?$" = "workspace"
 
 [ast]
 block_calls = ["eval", "exec", "compile", "breakpoint", "__import__"]

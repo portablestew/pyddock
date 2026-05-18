@@ -61,9 +61,14 @@ if path.is_dir():
     print(f"Cannot read '{path_str}': path is a directory, not a file.", file=sys.stderr)
     sys.exit(1)
 
-# Read with UTF-8 — fails on binary
+# Read with UTF-8 — fails on binary or permission denied
 try:
     content = path.read_text(encoding="utf-8")
+except PermissionError as e:
+    # Extract just the message, not the traceback (avoids leaking internal paths)
+    msg = str(e)
+    print(msg, file=sys.stderr)
+    sys.exit(1)
 except UnicodeDecodeError:
     print(
         f"Cannot read '{path_str}': file is binary or not UTF-8 encoded. "

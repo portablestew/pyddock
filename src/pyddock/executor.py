@@ -227,6 +227,10 @@ class SubprocessExecutor:
             "filesystem": {
                 "writable_paths": self._config.filesystem.writable_paths,
                 "readable_paths": self._config.filesystem.readable_paths,
+                "guards": [
+                    {"pattern": g.pattern, "disposition": g.disposition}
+                    for g in self._config.filesystem.guards
+                ],
             },
             "ast": {
                 "block_calls": self._config.ast.block_calls,
