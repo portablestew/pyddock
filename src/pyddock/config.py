@@ -170,16 +170,16 @@ def _parse_filesystem(data: dict) -> FilesystemConfig:
     if not isinstance(guards_section, dict):
         raise ConfigError("[filesystem.guards] must be a table")
     guards: list[GuardRule] = []
-    _valid_dispositions = ("deny", "workspace", "allow")
+    _valid_dispositions = ("deny-agent", "deny-all", "workspace", "allow")
     for pattern, disposition in guards_section.items():
         if not isinstance(disposition, str):
             raise ConfigError(
                 f"[filesystem.guards].'{pattern}' must be a string "
-                f"('deny', 'workspace', or 'allow'), got {type(disposition).__name__}"
+                f"('deny-agent', 'deny-all', 'workspace', or 'allow'), got {type(disposition).__name__}"
             )
         if disposition not in _valid_dispositions:
             raise ConfigError(
-                f"[filesystem.guards].'{pattern}' must be 'deny', 'workspace', "
+                f"[filesystem.guards].'{pattern}' must be 'deny-agent', 'deny-all', 'workspace', "
                 f"or 'allow', got '{disposition}'"
             )
         guards.append(GuardRule(pattern=pattern, disposition=disposition))

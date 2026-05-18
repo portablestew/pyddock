@@ -43,13 +43,13 @@ class TestGuardConfigParsing:
         """Guards are parsed in TOML insertion order with correct types."""
         self._write_config(tmp_path, (
             "[filesystem.guards]\n"
-            "'/\\.ssh/' = 'deny'\n"
+            "'/\\.ssh/' = 'deny-all'\n"
             "'/\\.env$' = 'workspace'\n"
             "'/var/data/' = 'allow'\n"
         ))
         config = load_config(tmp_path)
         assert len(config.filesystem.guards) == 3
-        assert config.filesystem.guards[0] == GuardRule(pattern="/\\.ssh/", disposition="deny")
+        assert config.filesystem.guards[0] == GuardRule(pattern="/\\.ssh/", disposition="deny-all")
         assert config.filesystem.guards[1] == GuardRule(pattern="/\\.env$", disposition="workspace")
         assert config.filesystem.guards[2] == GuardRule(pattern="/var/data/", disposition="allow")
 
@@ -59,7 +59,7 @@ class TestGuardConfigParsing:
             "[filesystem.guards]\n"
             "'/\\.ssh/' = 'block'\n"
         ))
-        with pytest.raises(ConfigError, match="'deny', 'workspace', or 'allow'"):
+        with pytest.raises(ConfigError, match="'deny-agent', 'deny-all', 'workspace', or 'allow'"):
             load_config(tmp_path)
 
 
@@ -93,11 +93,11 @@ class TestGuardEnforcement:
         executor = SubprocessExecutor(config, vm)
         return executor, ws
 
-    def test_deny_blocks_read(self, tmp_path: Path) -> None:
-        """Guard with disposition 'deny' blocks reads."""
+    def test_deny_all_blocks_read(self, tmp_path: Path) -> None:
+        """Guard with disposition 'deny-all' blocks reads unconditionally."""
         executor, ws = self._make_executor(tmp_path, (
             "[filesystem.guards]\n"
-            "'/secret\\.txt$' = 'deny'\n"
+            "'/secret\\.txt$' = 'deny-all'\n"
         ))
         secret = tmp_path / "secret.txt"
         secret.write_text("top secret", encoding="utf-8")
@@ -152,7 +152,7 @@ class TestGuardEnforcement:
         executor, ws = self._make_executor(tmp_path, (
             "[filesystem.guards]\n"
             "'/special\\.env$' = 'allow'\n"
-            "'/\\.env' = 'deny'\n"
+            "'/\\.env' = 'deny-all'\n"
         ))
         special = tmp_path / "special.env"
         special.write_text("allowed", encoding="utf-8")

@@ -107,7 +107,7 @@ Pyddock also exposes file I/O tools that execute through the same sandbox as `ru
 
 Writes are restricted to the workspace. The `.pyddock/` directory, pyddock source, and the Python stdlib directory are always write-protected (`.pyddock/tmp/` is the exception, used by tempfile). Reads are unrestricted by default but subject to filesystem guards.
 
-**Filesystem guards** (`[filesystem.guards]`) provide regex-based path rules that apply to both reads and writes. Each pattern maps to a disposition: `"deny"` (block unconditionally), `"workspace"` (allow only inside the workspace), or `"allow"` (permit unconditionally). First match listed in the toml wins. Assorted secrets are blocked by default (`~/.ssh/`, `~/.aws/credentials`, `~/.gnupg/`, etc.). `.env` files are restricted to workspace-only access.
+**Filesystem guards** (`[filesystem.guards]`) provide regex-based path rules that apply to both reads and writes. Each pattern maps to a disposition: `"deny-agent"` (block agent code; trusted libraries bypass), `"deny-all"` (block unconditionally), `"workspace"` (allow only inside the workspace), or `"allow"` (permit unconditionally). First match listed in the toml wins. Assorted secrets are blocked by default (`~/.ssh/`, `~/.aws/credentials`, `~/.gnupg/`, etc.). `.env` files are restricted to workspace-only access.
 
 ## Configuration
 
@@ -140,8 +140,9 @@ writable_paths = ["."]   # "." = workspace directory; "*" = unrestricted
 readable_paths = ["*"]
 
 [filesystem.guards]      # regex → disposition (first match wins)
-"/\\.ssh/" = "deny"
-"/\\.aws/credentials$" = "deny"
+"/\\.ssh/" = "deny-agent"
+"/\\.aws/credentials$" = "deny-agent"
+"/\\.npmrc$" = "deny-all"
 "/\\.env(\\.[^/]*)?$" = "workspace"
 
 [ast]

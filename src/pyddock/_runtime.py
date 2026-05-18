@@ -1047,6 +1047,7 @@ class RuntimeEnforcement:
                 pass  # Skip invalid patterns silently (logged at config load time)
 
         _workspace_root_abs = _abspath(workspace_root)
+        _guard_trusted_prefixes = self._trusted_prefixes
 
         def _check_guard(path: pathlib.Path, operation: str) -> bool | None:
             """Check path against filesystem guards. Returns:
@@ -1063,11 +1064,25 @@ class RuntimeEnforcement:
 
             for pattern, disposition in compiled_guards:
                 if pattern.search(path_str):
-                    if disposition == "deny":
+                    if disposition == "deny-agent":
+                        # "deny-agent" blocks agent code but allows trusted libraries
+                        # (site-packages, workspace modules) to access the path.
+                        if _guard_trusted_prefixes and _caller_is_trusted(_guard_trusted_prefixes):
+                            return True  # trusted library — allow
                         raise PermissionError(
                             f"PermissionError: Cannot {operation} '{path}' — "
                             f"path matches a filesystem guard (pattern: "
-                            f"'{pattern.pattern}', disposition: deny). "
+                            f"'{pattern.pattern}', disposition: deny-agent). "
+                            f"This path is blocked for security."
+                        )
+                    elif disposition == "deny-all":
+                        # "deny-all" blocks everyone unconditionally — no
+                        # trusted caller bypass. Use for paths where no
+                        # legitimate library reader exists in this sandbox.
+                        raise PermissionError(
+                            f"PermissionError: Cannot {operation} '{path}' — "
+                            f"path matches a filesystem guard (pattern: "
+                            f"'{pattern.pattern}', disposition: deny-all). "
                             f"This path is blocked for security."
                         )
                     elif disposition == "workspace":
