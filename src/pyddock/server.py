@@ -35,6 +35,8 @@ def _build_tool_description(config: PyddockConfig) -> str:
         "",
         "Each call runs in a fresh process — no state persists between calls. Include all setup (imports, file reads, DataFrame construction) in each snippet.",
         "",
+        f"Default timeout: {config.execution.timeout}s. Max allowed: {config.execution.max_timeout}s. Pass a 'timeout' parameter to override.",
+        "",
         "Environment variables: os.environ is available (read-only). To pass env context to subprocess.run() calls, read from os.environ in your snippet.",
         "",
         "subprocess.run() and subprocess.Popen() are available inside snippets with the same shell policy enforcement as run_shell. Interpreter mapping is automatic (.ps1→powershell, .py→python, .sh→bash, .bat→cmd /c). Use this to compose multiple commands, process output between calls, or build argument lists dynamically.",
@@ -75,6 +77,8 @@ def _build_shell_tool_description(config: PyddockConfig) -> str:
         "",
         "For composing multiple commands, processing output between calls, passing environment variables, "
         "or dynamic argument construction, use run_python with subprocess.run([...]) instead — it enforces the same policies.",
+        "",
+        f"Default timeout: {config.execution.timeout}s. Max allowed: {config.execution.max_timeout}s. Pass a 'timeout' parameter to override.",
         "",
         "Configured commands:",
     ]

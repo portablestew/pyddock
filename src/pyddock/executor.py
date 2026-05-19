@@ -14,7 +14,7 @@ from pathlib import Path
 
 from pyddock import SNIPPET_FILENAME
 from pyddock.config import PyddockConfig
-from pyddock._process_utils import get_startupinfo, make_child_env
+from pyddock._process_utils import get_startupinfo, kill_and_drain, make_child_env, truncate_output
 from pyddock.venv_manager import VenvManager
 
 # Sentinel used to extract the last-expression repr from stdout.
@@ -110,20 +110,17 @@ class SubprocessExecutor:
             try:
                 stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                # Kill the process tree on timeout
-                if os.name == "nt":
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        capture_output=True,
-                    )
-                else:
-                    import signal
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                proc.wait(timeout=5)
+                stdout_partial, stderr_partial = kill_and_drain(proc)
+                timeout_msg = (
+                    f"TimeoutError: Execution exceeded {timeout}s limit. "
+                    f"Increase the timeout parameter if this task needs more time."
+                )
+                combined_stderr = (
+                    f"{timeout_msg}\n{stderr_partial}" if stderr_partial else timeout_msg
+                )
                 return RunPythonOutput(
-                    stdout="",
-                    stderr=f"TimeoutError: Execution exceeded {timeout}s limit. "
-                    f"Increase the timeout parameter if this task needs more time.",
+                    stdout=stdout_partial,
+                    stderr=combined_stderr,
                     result=None,
                     exit_code=1,
                 )
@@ -132,18 +129,8 @@ class SubprocessExecutor:
             stderr_str = stderr_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n")
 
             # Truncate large outputs to prevent memory/transport issues
-            # 64 KB ≈ 16K tokens — enough for useful output without dominating agent context
-            max_output = 65_536  # 64 KB
-            if len(stdout_str) > max_output:
-                stdout_str = stdout_str[:max_output] + (
-                    "\n\n[truncated: output exceeded 64 KB. "
-                    "For large results, write to a file instead of printing.]"
-                )
-            if len(stderr_str) > max_output:
-                stderr_str = stderr_str[:max_output] + (
-                    "\n\n[truncated: stderr exceeded 64 KB. "
-                    "For large results, write to a file instead of printing.]"
-                )
+            stdout_str = truncate_output(stdout_str, "output")
+            stderr_str = truncate_output(stderr_str, "stderr")
             stdout, result = self._parse_result(stdout_str)
 
             return RunPythonOutput(

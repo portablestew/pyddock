@@ -46,3 +46,43 @@ def get_startupinfo() -> subprocess.STARTUPINFO:
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 0  # SW_HIDE
     return si
+
+
+# 64 KB ≈ 16K tokens — enough for useful output without dominating agent context
+MAX_OUTPUT_BYTES = 65_536
+
+
+def truncate_output(text: str, label: str = "output", limit: int = MAX_OUTPUT_BYTES) -> str:
+    """Truncate text to *limit* characters, appending a notice if trimmed."""
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit]
+        + f"\n\n[truncated: {label} exceeded 64 KB. "
+        f"For large results, write to a file instead of printing.]"
+    )
+
+
+def kill_and_drain(proc: subprocess.Popen) -> tuple[str, str]:
+    """Kill a timed-out process tree and return its buffered stdout/stderr (truncated).
+
+    Performs a forceful kill (taskkill on Windows, SIGKILL on Unix), then drains
+    whatever output was already buffered in the OS pipes before the process died.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+        )
+    else:
+        import signal
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    # Drain any partial output buffered in the pipes
+    stdout_bytes, stderr_bytes = proc.communicate()
+    stdout = truncate_output(
+        stdout_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n"), "output"
+    )
+    stderr = truncate_output(
+        stderr_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n"), "stderr"
+    )
+    return stdout, stderr

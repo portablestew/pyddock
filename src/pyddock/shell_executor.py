@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pyddock.config import PyddockConfig, ShellPolicyConfig
-from pyddock._process_utils import get_startupinfo, make_child_env
+from pyddock._process_utils import get_startupinfo, kill_and_drain, make_child_env, truncate_output
 
 import shutil
 
@@ -186,23 +186,18 @@ class ShellExecutor:
             try:
                 stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                # Kill the process tree on timeout
-                if _os.name == "nt":
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        capture_output=True,
-                    )
-                else:
-                    import signal
-                    _os.killpg(_os.getpgid(proc.pid), signal.SIGKILL)
-                proc.wait(timeout=5)
+                stdout_partial, stderr_partial = kill_and_drain(proc)
+                timeout_msg = (
+                    f"TimeoutError: Command exceeded {timeout}s limit. "
+                    f"Increase the timeout parameter if this task needs more time.\n"
+                    f"Tip: Use run_python for complex workflows."
+                )
+                combined_stderr = (
+                    f"{timeout_msg}\n{stderr_partial}" if stderr_partial else timeout_msg
+                )
                 return RunShellOutput(
-                    stdout="",
-                    stderr=(
-                        f"TimeoutError: Command exceeded {timeout}s limit. "
-                        f"Increase the timeout parameter if this task needs more time.\n"
-                        f"Tip: Use run_python for complex workflows."
-                    ),
+                    stdout=stdout_partial,
+                    stderr=combined_stderr,
                     exit_code=1,
                 )
 
@@ -211,12 +206,9 @@ class ShellExecutor:
             # Normalize line endings (Windows)
             stdout = stdout.replace("\r\n", "\n")
             stderr = stderr.replace("\r\n", "\n")
-            # Truncate at 64 KB to prevent memory/transport issues
-            max_output = 65_536
-            if len(stdout) > max_output:
-                stdout = stdout[:max_output] + "\n\n[truncated: output exceeded 64 KB]"
-            if len(stderr) > max_output:
-                stderr = stderr[:max_output] + "\n\n[truncated: stderr exceeded 64 KB]"
+            # Truncate large outputs to prevent memory/transport issues
+            stdout = truncate_output(stdout, "output")
+            stderr = truncate_output(stderr, "stderr")
             return RunShellOutput(
                 stdout=stdout,
                 stderr=stderr,

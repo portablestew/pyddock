@@ -236,24 +236,29 @@ class TestExecute:
         assert "not permitted" in result.stderr
 
     def test_timeout_handling(self, tmp_path: Path) -> None:
-        """Timeout returns structured error."""
+        """Timeout returns structured error with partial output."""
         config = _make_config(shell={
             "python": ShellPolicyConfig(command="^python$", mode="allow", deny=[]),
         })
         executor = ShellExecutor(config, tmp_path)
 
         mock_proc = MagicMock()
-        mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd="python", timeout=1.0)
+        mock_proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="python", timeout=1.0),
+            (b"partial stdout\n", b"partial stderr\n"),  # drained after kill
+        ]
         mock_proc.pid = 12345
-        mock_proc.wait.return_value = None
 
         with patch("pyddock.shell_executor.subprocess.Popen", return_value=mock_proc):
-            with patch("pyddock.shell_executor.subprocess.run"):  # for taskkill
+            with patch("pyddock._process_utils.subprocess.run"):  # for taskkill
                 result = executor.execute("python", ["-c", "import time; time.sleep(99)"], 1.0)
 
         assert result.exit_code == 1
         assert "TimeoutError" in result.stderr
         assert "run_python" in result.stderr
+        # Partial output from before the timeout should be preserved
+        assert "partial stdout" in result.stdout
+        assert "partial stderr" in result.stderr
 
     def test_command_not_found(self, tmp_path: Path) -> None:
         """FileNotFoundError returns structured error."""
