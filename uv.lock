@@ -493,7 +493,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp" }]
+requires-dist = [{ name = "mcp", specifier = ">=1.0" }]
 
 [package.metadata.requires-dev]
 dev = [

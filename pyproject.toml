@@ -1,11 +1,33 @@
 [project]
 name = "pyddock"
 version = "0.1.0"
-description = "MCP server exposing a policy-controlled run_python tool"
+description = "MCP server that gives AI agents pre-approved Python, shell, and file I/O tools with declarative policy controls"
 requires-python = ">=3.11"
-dependencies = [
-    "mcp",
+license = "MIT"
+readme = "README.md"
+authors = [
+    { name = "portablestew" },
 ]
+keywords = ["mcp", "ai", "agents", "sandbox", "python", "shell"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Security",
+]
+dependencies = [
+    "mcp>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/portablestew/pyddock"
+Repository = "https://github.com/portablestew/pyddock"
+Issues = "https://github.com/portablestew/pyddock/issues"
 
 [project.scripts]
 pyddock = "pyddock.cli:main"
