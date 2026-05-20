@@ -29,8 +29,8 @@ pyddock provides Python execution and shell command access with declarative poli
 {
   "mcpServers": {
     "pyddock": {
-      "command": "uv.exe",
-      "args": ["--directory", "<path-to-pyddock-source>", "run", "pyddock", "serve", "--workspace", "<path-to-workspace>"],
+      "command": "uvx",
+      "args": ["pyddock", "serve", "--workspace", "<path-to-workspace>"],
       "autoApprove": ["run_python","run_shell","fs_read","fs_stat","fs_append","fs_delete","fs_str_replace"]
     }
   }
