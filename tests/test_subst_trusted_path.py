@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pyddock import SNIPPET_FILENAME
+from pyddock._runtime import SNIPPET_FILENAME
 from pyddock._runtime import _caller_is_trusted, _normcase, _realpath
 
 

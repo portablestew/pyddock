@@ -12,7 +12,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from pyddock import SNIPPET_FILENAME
+from pyddock._runtime import SNIPPET_FILENAME
 from pyddock.config import PyddockConfig
 from pyddock._process_utils import get_startupinfo, kill_and_drain, make_child_env, truncate_output
 from pyddock.venv_manager import VenvManager

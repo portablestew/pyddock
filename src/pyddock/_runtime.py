@@ -21,7 +21,11 @@ import tempfile as _tempfile_module
 import types
 from typing import Any
 
-from pyddock import SNIPPET_FILENAME
+# Filename used for compile() when executing agent snippets.
+# Defined here (not in __init__.py) so _runtime.py doesn't need to import
+# the pyddock package — which would trigger importlib.metadata inside the
+# sandbox subprocess where pyddock isn't installed as a package.
+SNIPPET_FILENAME = "<snippet>"
 
 # Resolved at module load time (before the import hook activates).
 # Used by _caller_is_trusted to skip pyddock's own frames.
@@ -1345,25 +1349,46 @@ class RuntimeEnforcement:
                 f"Hard link creation is disabled to prevent filesystem bypass."
             )
 
-        def _blocked_chmod(self_path: pathlib.Path, *args: Any, **kwargs: Any) -> None:
-            raise PermissionError(
-                f"PermissionError: Path.chmod() is not permitted. "
-                f"Permission changes are disabled."
-            )
+        # chmod validation: block special bits (setuid/setgid/sticky) which
+        # change how the OS treats the file. Standard permission bits (owner,
+        # group, other rwx) are allowed — _check_write() already controls
+        # which files can be modified at all.
+        _CHMOD_SPECIAL_BITS = 0o7000
 
-        def _blocked_lchmod(self_path: pathlib.Path, *args: Any, **kwargs: Any) -> None:
-            raise PermissionError(
-                f"PermissionError: Path.lchmod() is not permitted. "
-                f"Permission changes are disabled."
-            )
+        def _validate_chmod(mode: int, caller: str) -> None:
+            """Reject non-integer or special-bit modes."""
+            if not isinstance(mode, int):
+                raise PermissionError(
+                    f"PermissionError: {caller} mode must be an integer."
+                )
+            if mode & _CHMOD_SPECIAL_BITS:
+                raise PermissionError(
+                    f"PermissionError: {caller} mode {oct(mode)} requests "
+                    f"special bits ({oct(mode & _CHMOD_SPECIAL_BITS)}). "
+                    f"setuid/setgid/sticky are not permitted."
+                )
+
+        _ORIGINALS["Path.chmod"] = pathlib.Path.chmod
+        if hasattr(pathlib.Path, "lchmod"):
+            _ORIGINALS["Path.lchmod"] = pathlib.Path.lchmod
+
+        def _guarded_chmod(self_path: pathlib.Path, mode: int, *args: Any, **kwargs: Any) -> None:
+            _validate_chmod(mode, "Path.chmod()")
+            _check_write(self_path)
+            return _ORIGINALS["Path.chmod"](self_path, mode, *args, **kwargs)
+
+        def _guarded_lchmod(self_path: pathlib.Path, mode: int, *args: Any, **kwargs: Any) -> None:
+            _validate_chmod(mode, "Path.lchmod()")
+            _check_write(self_path)
+            return _ORIGINALS["Path.lchmod"](self_path, mode, *args, **kwargs)
 
         pathlib.Path.symlink_to = _blocked_symlink_to
         pathlib.Path.hardlink_to = _blocked_hardlink_to
         if hasattr(pathlib.Path, "link_to"):
             pathlib.Path.link_to = _blocked_link_to
-        pathlib.Path.chmod = _blocked_chmod
+        pathlib.Path.chmod = _guarded_chmod
         if hasattr(pathlib.Path, "lchmod"):
-            pathlib.Path.lchmod = _blocked_lchmod
+            pathlib.Path.lchmod = _guarded_lchmod
 
         # Patch io.open — it's a separate function from builtins.open
         # and can bypass filesystem scoping if not patched.
@@ -1484,6 +1509,15 @@ class RuntimeEnforcement:
             safe_os = sys.modules["os"]
             safe_os.makedirs = _safe_makedirs
             safe_os.mkdir = _safe_mkdir
+
+        # Expose os.chmod with the same validation as Path.chmod.
+        def _safe_chmod(path: str, mode: int) -> None:
+            _validate_chmod(mode, "os.chmod()")
+            _check_write(pathlib.Path(path))
+            _real_os.chmod(path, mode)
+
+        if "os" in sys.modules:
+            sys.modules["os"].chmod = _safe_chmod
 
     def apply_restrictions(self) -> None:
         """Apply module-level and class-level restrictions.

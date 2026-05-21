@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from pyddock import SNIPPET_FILENAME
+from pyddock._runtime import SNIPPET_FILENAME
 from pyddock.config import (
     ASTConfig,
     ExecutionConfig,

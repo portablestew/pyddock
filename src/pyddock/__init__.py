@@ -1,8 +1,10 @@
 """pyddock — policy-controlled Python execution via MCP."""
 
-__version__ = "0.1.1"
+from importlib.metadata import PackageNotFoundError, version
 
-# Filename used for compile() when executing agent snippets.
-# Used by executor (compile source), runtime (stack inspection to identify
-# agent code vs trusted library code), and tests.
-SNIPPET_FILENAME = "<snippet>"
+try:
+    __version__ = version("pyddock")
+except PackageNotFoundError:
+    # Running inside the sandbox subprocess where pyddock is on sys.path
+    # but not installed as a package (no dist-info metadata).
+    __version__ = "0.0.0"
