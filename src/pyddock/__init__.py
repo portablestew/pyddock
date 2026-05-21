@@ -1,6 +1,6 @@
 """pyddock — policy-controlled Python execution via MCP."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Filename used for compile() when executing agent snippets.
 # Used by executor (compile source), runtime (stack inspection to identify
