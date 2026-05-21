@@ -266,8 +266,8 @@ def create_server(workspace: Path | None = None) -> FastMCP:
         "Omit start/end for the whole file. Fails on binary/non-UTF-8 files."
     )
 
-    @mcp.tool(name="fs_read", description=_read_file_desc)
-    async def fs_read(
+    @mcp.tool(name="fs_readfile", description=_read_file_desc)
+    async def fs_readfile(
         path: str,
         start: int | None = None,
         end: int | None = None,

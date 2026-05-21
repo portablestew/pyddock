@@ -1,4 +1,4 @@
-"""Tests for pyddock file tools (fs_read, fs_stat, fs_append, fs_delete, fs_str_replace).
+"""Tests for pyddock file tools (fs_readfile, fs_stat, fs_append, fs_delete, fs_str_replace).
 
 Uses a session-scoped venv to avoid recreating it per test. Each test gets
 its own subdirectory within the shared workspace for isolation.
@@ -83,7 +83,7 @@ def run(registry: ScriptToolRegistry, script: str, params: dict) -> str:
 
 
 # =============================================================================
-# fs_read tests
+# fs_readfile tests
 # =============================================================================
 
 

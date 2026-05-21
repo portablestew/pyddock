@@ -31,7 +31,7 @@ pyddock provides Python execution and shell command access with declarative poli
     "pyddock": {
       "command": "uvx",
       "args": ["pyddock", "serve", "--workspace", "<path-to-workspace>"],
-      "autoApprove": ["run_python","run_shell","fs_read","fs_stat","fs_append","fs_delete","fs_str_replace"]
+      "autoApprove": ["run_python","run_shell","fs_readfile","fs_stat","fs_append","fs_delete","fs_str_replace"]
     }
   }
 }
@@ -83,7 +83,7 @@ Warning: deprecated API
 
 Pyddock also exposes file I/O tools that execute through the same sandbox as `run_python` — same filesystem scoping, same protected directories, same policy enforcement. These are convenience shortcuts for common file operations; agents can't do anything they couldn't already do via `run_python` with `pathlib`. On failure, error messages include diagnostic context to guide the agent's next attempt.
 
-- **`fs_read`** — Read a text file. Lines are 1-indexed; negative start = tail. Truncates large output with a continuation hint.
+- **`fs_readfile`** — Read a text file. Lines are 1-indexed; negative start = tail. Truncates large output with a continuation hint.
 - **`fs_stat`** — File metadata (exists, type, size, line count, modified). Returns `exists: false` for missing paths.
 - **`fs_append`** — Append to a file (creates if missing). Returns a unified diff.
 - **`fs_delete`** — Delete a file or empty directory. Returns a unified diff of removed content.
