@@ -10,7 +10,7 @@ build/
 
 # Virtual environments
 .venv/
-.pyddock/venv/
+.pyddock/
 
 # IDE
 .idea/
@@ -27,6 +27,3 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
-
-# Temp
-.pyddock/tmp/
