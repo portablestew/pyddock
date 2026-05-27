@@ -1152,6 +1152,16 @@ class RuntimeEnforcement:
                             f"'{pattern.pattern}', disposition: deny-all). "
                             f"This path is blocked for security."
                         )
+                    elif disposition == "read-only":
+                        # "read-only" allows reads but blocks writes.
+                        if operation == "read":
+                            return True  # reads permitted
+                        raise PermissionError(
+                            f"PermissionError: Cannot {operation} '{path}' — "
+                            f"path matches a filesystem guard (pattern: "
+                            f"'{pattern.pattern}', disposition: read-only). "
+                            f"This path is read-only."
+                        )
                     elif disposition == "workspace":
                         try:
                             path.relative_to(_workspace_root_abs)

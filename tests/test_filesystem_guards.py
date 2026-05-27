@@ -59,7 +59,7 @@ class TestGuardConfigParsing:
             "[filesystem.guards]\n"
             "'/\\.ssh/' = 'block'\n"
         ))
-        with pytest.raises(ConfigError, match="'deny-agent', 'deny-all', 'workspace', or 'allow'"):
+        with pytest.raises(ConfigError, match="'deny-agent', 'deny-all', 'read-only', 'workspace', or 'allow'"):
             load_config(tmp_path)
 
 

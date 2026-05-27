@@ -83,6 +83,7 @@ readable_paths = ["*"]
 # Dispositions:
 #   "deny-agent" — block agent code; trusted libraries (site-packages) can still access
 #   "deny-all"   — block unconditionally, no caller bypass
+#   "read-only"  — allow reads, block writes unconditionally
 #   "workspace"  — allow only if the path is inside the workspace
 #   "allow"      — permit unconditionally (override for specific paths)
 [filesystem.guards]
@@ -96,9 +97,9 @@ readable_paths = ["*"]
 '/\.pypirc$' = "deny-all"               # PyPI registry tokens — no library reader in sandbox
 '/\.git-credentials$' = "deny-all"       # Git plaintext passwords — no library reader in sandbox
 '/\.env(\.[^/]*)?$' = "workspace"        # .env files — workspace only
-'/\.kiro/agent' = "deny-all"             # Kiro agent config — prevent self-modification
-'/\.kiro/settings' = "deny-all"          # Kiro settings — prevent self-modification
-'/\.claude/settings' = "deny-all"        # Claude settings — prevent self-modification
+'/\.kiro/agent' = "read-only"             # Kiro agent config — prevent self-modification
+'/\.kiro/settings' = "read-only"          # Kiro settings — prevent self-modification
+'/\.claude/settings' = "read-only"        # Claude settings — prevent self-modification
 
 # AST-level static analysis — blocks dangerous constructs before execution.
 # These prevent trivial jailbreaks (e.g. eval("__import__('os').system(...)")).
