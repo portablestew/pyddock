@@ -13,7 +13,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from pyddock.config import PyddockConfig, ShellPolicyConfig
+from pyddock.config import PyddockConfig, ShellPolicyConfig, find_deny_hint
 from pyddock._process_utils import get_startupinfo, kill_and_drain, make_child_env, truncate_output
 
 import shutil
@@ -139,25 +139,39 @@ class ShellExecutor:
             configured = ", ".join(
                 p.command for p in self._config.shell.values()
             )
+            msg = (
+                f"Command '{command}' is not allowed. "
+                f"No matching [shell.*] policy found.\n"
+                f"Configured command patterns: {configured}\n"
+                f"Tip: Use run_python for complex workflows."
+            )
+            hint = find_deny_hint(command, self._config.deny_messages)
+            if hint:
+                msg += f"\n[{hint}]"
             return RunShellOutput(
                 stdout="",
-                stderr=(
-                    f"Command '{command}' is not allowed. "
-                    f"No matching [shell.*] policy found.\n"
-                    f"Configured command patterns: {configured}\n"
-                    f"Tip: Use run_python for complex workflows."
-                ),
+                stderr=msg,
                 exit_code=1,
             )
 
         # Step 2: Check args against policy
         rejection = self._check_args_policy(policy, args)
         if rejection is not None:
+            hint = find_deny_hint(
+                f"{command} {' '.join(args)}", self._config.deny_messages
+            )
+            if hint:
+                rejection += f"\n[{hint}]"
             return RunShellOutput(stdout="", stderr=rejection, exit_code=1)
 
         # Step 3: Check args for path-like values targeting protected dirs
         path_rejection = self._check_arg_paths(policy, args)
         if path_rejection is not None:
+            hint = find_deny_hint(
+                f"{command} {' '.join(args)}", self._config.deny_messages
+            )
+            if hint:
+                path_rejection += f"\n[{hint}]"
             return RunShellOutput(stdout="", stderr=path_rejection, exit_code=1)
 
         # Step 4: Resolve interpreter prefix

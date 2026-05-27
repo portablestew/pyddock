@@ -44,6 +44,19 @@ del _os_for_path
 _ORIGINALS: dict[str, Any] = {}
 
 
+def _find_deny_hint(attempted: str, deny_messages: list[tuple[re.Pattern[str], str]]) -> str | None:
+    """Return the first matching deny hint for the attempted action, or None.
+
+    This is the subprocess-side equivalent of config.find_deny_hint().
+    It operates on pre-compiled (pattern, message) tuples reconstructed
+    from the serialized config dict.
+    """
+    for pattern, message in deny_messages:
+        if pattern.search(attempted):
+            return message
+    return None
+
+
 def _is_infra_frame(filename: str) -> bool:
     """Return True if the frame belongs to import infrastructure or pyddock itself.
 
@@ -104,9 +117,15 @@ class _ImportBlocker:
     trusted path (workspace module or its transitive dependency in site-packages).
     """
 
-    def __init__(self, allowed: list[str], trusted_prefixes: list[str]) -> None:
+    def __init__(
+        self,
+        allowed: list[str],
+        trusted_prefixes: list[str],
+        deny_messages: list[tuple[re.Pattern[str], str]] | None = None,
+    ) -> None:
         self._allowed = set(allowed)
         self._trusted_prefixes = tuple(trusted_prefixes)
+        self._deny_messages = deny_messages or []
 
     def find_module(self, fullname: str, path: Any = None) -> _ImportBlocker | None:
         """Legacy import hook interface for compatibility."""
@@ -117,10 +136,14 @@ class _ImportBlocker:
     def load_module(self, fullname: str) -> None:
         """Raise ImportError for blocked modules (legacy interface)."""
         allowed_list = ", ".join(sorted(self._allowed))
-        raise ImportError(
+        msg = (
             f"ImportError: '{fullname}' is not an allowed import. "
             f"Please use one of the following allowed imports instead: {allowed_list}"
         )
+        hint = _find_deny_hint(fullname, self._deny_messages)
+        if hint:
+            msg += f"\n[{hint}]"
+        raise ImportError(msg)
 
     def find_spec(
         self, fullname: str, path: Any = None, target: Any = None
@@ -132,11 +155,15 @@ class _ImportBlocker:
         """
         if self._should_block(fullname):
             allowed_list = ", ".join(sorted(self._allowed))
-            raise ImportError(
+            msg = (
                 f"ImportError: '{fullname}' is not an allowed import. "
                 f"Please use one of the following allowed imports instead: "
                 f"{allowed_list}"
             )
+            hint = _find_deny_hint(fullname, self._deny_messages)
+            if hint:
+                msg += f"\n[{hint}]"
+            raise ImportError(msg)
         return None
 
     def _should_block(self, fullname: str) -> bool:
@@ -157,9 +184,17 @@ class MethodFilterProxy:
     Only methods matching at least one allow pattern are permitted.
     """
 
-    def __init__(self, wrapped: Any, allow_patterns: list[re.Pattern[str]]) -> None:
+    def __init__(
+        self,
+        wrapped: Any,
+        allow_patterns: list[re.Pattern[str]],
+        deny_messages: list[tuple[re.Pattern[str], str]] | None = None,
+        module_name: str = "",
+    ) -> None:
         object.__setattr__(self, "_wrapped", wrapped)
         object.__setattr__(self, "_allow_patterns", allow_patterns)
+        object.__setattr__(self, "_deny_messages", deny_messages or [])
+        object.__setattr__(self, "_module_name", module_name)
 
     def __getattr__(self, name: str) -> Any:
         allow_patterns = object.__getattribute__(self, "_allow_patterns")
@@ -171,11 +206,18 @@ class MethodFilterProxy:
 
         if not any(p.match(name) for p in allow_patterns):
             patterns_str = ", ".join(p.pattern for p in allow_patterns)
-            raise PermissionError(
+            msg = (
                 f"PermissionError: '{name}' is not permitted. "
                 f"Allowed method patterns: {patterns_str}. "
                 f"Please use one of the allowed methods instead."
             )
+            deny_messages = object.__getattribute__(self, "_deny_messages")
+            module_name = object.__getattribute__(self, "_module_name")
+            attempted = f"{module_name}.{name}" if module_name else name
+            hint = _find_deny_hint(attempted, deny_messages)
+            if hint:
+                msg += f"\n[{hint}]"
+            raise PermissionError(msg)
         return getattr(wrapped, name)
 
 
@@ -187,14 +229,22 @@ class FactoryProxy:
     """
 
     def __init__(
-        self, original_factory: Any, allow_patterns: list[re.Pattern[str]]
+        self,
+        original_factory: Any,
+        allow_patterns: list[re.Pattern[str]],
+        deny_messages: list[tuple[re.Pattern[str], str]] | None = None,
+        module_name: str = "",
     ) -> None:
         self._original = original_factory
         self._allow_patterns = allow_patterns
+        self._deny_messages = deny_messages or []
+        self._module_name = module_name
 
     def __call__(self, *args: Any, **kwargs: Any) -> MethodFilterProxy:
         obj = self._original(*args, **kwargs)
-        return MethodFilterProxy(obj, self._allow_patterns)
+        return MethodFilterProxy(
+            obj, self._allow_patterns, self._deny_messages, self._module_name
+        )
 
 
 def _expand_patterns(
@@ -581,6 +631,14 @@ class RuntimeEnforcement:
         # Use abspath (not resolve) to preserve symlinks/subst drives
         import os as _os_init
         self._workspace_root = pathlib.Path(_os_init.path.abspath(workspace_root))
+        # Pre-compile deny_messages patterns from serialized config
+        self._deny_messages: list[tuple[re.Pattern[str], str]] = []
+        for entry in config.get("deny_messages", []):
+            try:
+                pattern = re.compile(entry["pattern"])
+                self._deny_messages.append((pattern, entry["message"]))
+            except (re.error, KeyError, TypeError):
+                pass  # Skip malformed entries silently in subprocess
 
     def apply_all(self) -> None:
         """Apply all enforcement in order: import hook, filesystem, proxies, patches, subprocess."""
@@ -714,7 +772,7 @@ class RuntimeEnforcement:
         except ImportError:
             pass
 
-        blocker = _ImportBlocker(allowed, trusted_prefixes_tuple)
+        blocker = _ImportBlocker(allowed, trusted_prefixes_tuple, self._deny_messages)
         # Insert at the beginning so it's checked first
         sys.meta_path.insert(0, blocker)
 
@@ -733,6 +791,7 @@ class RuntimeEnforcement:
         # need caller-scoped proxying to block ModuleType attr leakage (e.g. polars.os).
         _skip_proxy = frozenset({"os", "sys", "threading"})
         _ws_module_names = frozenset(workspace_imports.keys())
+        _deny_msgs = self._deny_messages
 
         def _guarded_import(name: str, *args: Any, **kwargs: Any) -> Any:
             # For relative imports (level > 0), the name is relative to the
@@ -770,11 +829,15 @@ class RuntimeEnforcement:
             if _trusted and _caller_is_trusted(_trusted):
                 return _ORIGINALS["import"](name, *args, **kwargs)
             allowed_list = ", ".join(sorted(allowed_set))
-            raise ImportError(
+            msg = (
                 f"ImportError: '{name}' is not an allowed import. "
                 f"Please use one of the following allowed imports "
                 f"instead: {allowed_list}"
             )
+            hint = _find_deny_hint(name, _deny_msgs)
+            if hint:
+                msg += f"\n[{hint}]"
+            raise ImportError(msg)
 
         builtins.__import__ = _guarded_import
 
@@ -1580,7 +1643,8 @@ class RuntimeEnforcement:
                         attr = getattr(module, attr_name, None)
                         if attr is not None and callable(attr) and not isinstance(attr, type):
                             custom_attrs[attr_name] = FactoryProxy(
-                                attr, compiled_class_patterns
+                                attr, compiled_class_patterns,
+                                self._deny_messages, module_name,
                             )
 
                 proxy = _CallerScopedModuleProxy(
@@ -1609,31 +1673,39 @@ class RuntimeEnforcement:
                         if any(p.match(method_name) for p in deny_compiled):
                             self._patch_class_method(cls, method_name, module_name)
 
-    @staticmethod
     def _patch_module_function(
-        module: Any, func_name: str, module_name: str
+        self, module: Any, func_name: str, module_name: str
     ) -> None:
         """Replace a module-level function with one that raises PermissionError."""
+        deny_messages = self._deny_messages
 
         def _blocked(*args: Any, **kwargs: Any) -> None:
-            raise PermissionError(
+            msg = (
                 f"PermissionError: '{func_name}' is not permitted on {module_name}. "
                 f"Please rewrite your snippet to avoid this function."
             )
+            hint = _find_deny_hint(f"{module_name}.{func_name}", deny_messages)
+            if hint:
+                msg += f"\n[{hint}]"
+            raise PermissionError(msg)
 
         setattr(module, func_name, _blocked)
 
-    @staticmethod
     def _patch_class_method(
-        cls: Any, method_name: str, module_name: str
+        self, cls: Any, method_name: str, module_name: str
     ) -> None:
         """Replace a class method with one that raises PermissionError."""
+        deny_messages = self._deny_messages
 
         def _blocked(*args: Any, **kwargs: Any) -> None:
-            raise PermissionError(
+            msg = (
                 f"PermissionError: '{method_name}' is not permitted on {module_name}. "
                 f"Please rewrite your snippet to avoid this function."
             )
+            hint = _find_deny_hint(f"{module_name}.{method_name}", deny_messages)
+            if hint:
+                msg += f"\n[{hint}]"
+            raise PermissionError(msg)
 
         setattr(cls, method_name, _blocked)
 
@@ -1660,6 +1732,7 @@ class RuntimeEnforcement:
         _real_os = self._real_os
         _resolve_cmd = self._resolve_command
         shell_policies = self._config.get("shell", {})
+        _deny_msgs_sp = self._deny_messages
 
         # Build example command for error messages
         if shell_policies:
@@ -1833,18 +1906,34 @@ class RuntimeEnforcement:
             cmd_args = [str(a) for a in cmd[1:]]
             policy = _find_matching_policy(command)
             if policy is None:
-                raise PermissionError(
+                msg = (
                     f"PermissionError: Command '{command}' is not permitted. "
                     f"No matching shell policy found. "
                     f"Allowed commands: {allowed_commands_str}"
                 )
+                hint = _find_deny_hint(command, _deny_msgs_sp)
+                if hint:
+                    msg += f"\n[{hint}]"
+                raise PermissionError(msg)
             rejection = _check_args_policy(policy, cmd_args)
             if rejection is not None:
-                raise PermissionError(f"PermissionError: {rejection}")
+                msg = f"PermissionError: {rejection}"
+                hint = _find_deny_hint(
+                    f"{command} {' '.join(cmd_args)}", _deny_msgs_sp
+                )
+                if hint:
+                    msg += f"\n[{hint}]"
+                raise PermissionError(msg)
             # Check arg paths against protected directories
             path_rejection = _check_arg_paths(policy, cmd_args)
             if path_rejection is not None:
-                raise PermissionError(f"PermissionError: {path_rejection}")
+                msg = f"PermissionError: {path_rejection}"
+                hint = _find_deny_hint(
+                    f"{command} {' '.join(cmd_args)}", _deny_msgs_sp
+                )
+                if hint:
+                    msg += f"\n[{hint}]"
+                raise PermissionError(msg)
             # Apply interpreter mapping (same as run_shell) and execute
             resolved = _resolve_cmd(command)
             full_cmd = resolved + cmd_args
@@ -1879,17 +1968,33 @@ class RuntimeEnforcement:
             cmd_args = [str(a) for a in cmd[1:]]
             policy = _find_matching_policy(command)
             if policy is None:
-                raise PermissionError(
+                msg = (
                     f"PermissionError: Command '{command}' is not permitted. "
                     f"No matching shell policy found. "
                     f"Allowed commands: {allowed_commands_str}"
                 )
+                hint = _find_deny_hint(command, _deny_msgs_sp)
+                if hint:
+                    msg += f"\n[{hint}]"
+                raise PermissionError(msg)
             rejection = _check_args_policy(policy, cmd_args)
             if rejection is not None:
-                raise PermissionError(f"PermissionError: {rejection}")
+                msg = f"PermissionError: {rejection}"
+                hint = _find_deny_hint(
+                    f"{command} {' '.join(cmd_args)}", _deny_msgs_sp
+                )
+                if hint:
+                    msg += f"\n[{hint}]"
+                raise PermissionError(msg)
             path_rejection = _check_arg_paths(policy, cmd_args)
             if path_rejection is not None:
-                raise PermissionError(f"PermissionError: {path_rejection}")
+                msg = f"PermissionError: {path_rejection}"
+                hint = _find_deny_hint(
+                    f"{command} {' '.join(cmd_args)}", _deny_msgs_sp
+                )
+                if hint:
+                    msg += f"\n[{hint}]"
+                raise PermissionError(msg)
             resolved = _resolve_cmd(command)
             return resolved + cmd_args, cmd_args
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 
-from pyddock.config import PyddockConfig
+from pyddock.config import PyddockConfig, find_deny_hint
 
 
 @dataclass
@@ -125,6 +125,9 @@ class ASTValidator:
             f"ImportError: '{module_name}' is not an allowed import. "
             f"Please use one of the following allowed imports instead: {allowed_str}"
         )
+        hint = find_deny_hint(module_name, self._config.deny_messages)
+        if hint:
+            message += f"\n[{hint}]"
         return ASTViolation(
             kind="blocked_import",
             name=module_name,

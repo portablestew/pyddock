@@ -8,6 +8,7 @@ Resolution order:
 from __future__ import annotations
 
 import logging
+import re
 import tomllib
 from dataclasses import dataclass, field
 from importlib import resources
@@ -88,6 +89,31 @@ class ShellPolicyConfig:
 
 
 @dataclass
+class DenyMessageRule:
+    """A single deny_messages rule (compiled regex → hint text)."""
+
+    pattern: re.Pattern[str]
+    message: str
+
+
+def find_deny_hint(attempted: str, deny_messages: list[DenyMessageRule]) -> str | None:
+    """Return the first matching deny hint for the attempted action, or None.
+
+    Args:
+        attempted: The attempted action string (command, module name, or
+                   module.attribute depending on rejection type).
+        deny_messages: The parsed deny_messages rules from config.
+
+    Returns:
+        The hint message string if a pattern matches, else None.
+    """
+    for rule in deny_messages:
+        if rule.pattern.search(attempted):
+            return rule.message
+    return None
+
+
+@dataclass
 class PyddockConfig:
     """Top-level pyddock configuration."""
 
@@ -97,6 +123,7 @@ class PyddockConfig:
     ast: ASTConfig
     restrictions: dict[str, RestrictionConfig] = field(default_factory=dict)
     shell: dict[str, ShellPolicyConfig] = field(default_factory=dict)
+    deny_messages: list[DenyMessageRule] = field(default_factory=list)
 
 
 def _parse_execution(data: dict) -> ExecutionConfig:
@@ -319,6 +346,35 @@ def _parse_shell(data: dict) -> dict[str, ShellPolicyConfig]:
     return shell
 
 
+def _parse_deny_messages(data: dict) -> list[DenyMessageRule]:
+    """Parse the [deny_messages] section (table of regex → message strings).
+
+    Each key is a regex pattern matched against the attempted action
+    (command string, module name, or module.attribute). Each value is the
+    hint message appended to the rejection error. First match wins at runtime.
+    """
+    section = data.get("deny_messages", {})
+    if not isinstance(section, dict):
+        raise ConfigError("[deny_messages] must be a table")
+
+    rules: list[DenyMessageRule] = []
+    for pattern_str, message in section.items():
+        if not isinstance(message, str):
+            raise ConfigError(
+                f"[deny_messages].'{pattern_str}' must be a string, "
+                f"got {type(message).__name__}"
+            )
+        try:
+            compiled = re.compile(pattern_str)
+        except re.error as e:
+            raise ConfigError(
+                f"[deny_messages].'{pattern_str}' is not a valid regex: {e}"
+            )
+        rules.append(DenyMessageRule(pattern=compiled, message=message))
+
+    return rules
+
+
 def _deep_merge(base: dict, overlay: dict) -> dict:
     """Recursively merge *overlay* on top of *base* (neither is mutated).
 
@@ -344,6 +400,7 @@ def _parse_config(data: dict) -> PyddockConfig:
         ast=_parse_ast(data),
         restrictions=_parse_restrictions(data),
         shell=_parse_shell(data),
+        deny_messages=_parse_deny_messages(data),
     )
 
 

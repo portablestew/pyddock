@@ -243,6 +243,10 @@ class SubprocessExecutor:
                 }
                 for name, s in self._config.shell.items()
             },
+            "deny_messages": [
+                {"pattern": rule.pattern.pattern, "message": rule.message}
+                for rule in self._config.deny_messages
+            ],
         }
 
     @staticmethod

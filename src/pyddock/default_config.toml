@@ -62,9 +62,9 @@ tempfile = true
 # Third-party — controlled via [restrictions] sections below
 #boto3 = true # Enable for AWS (opens network access vectors, when with reasonable restrictions)
 dateutil = "python-dateutil"
-#git = "GitPython" # Enable for Git (shell policy enforces command restrictions via Popen)
+git = "GitPython" # Shell policy enforces command restrictions via Popen
 polars = true
-#P4 = "p4python" # Enable for Perforce (restricted to non-submit operations)
+P4 = "p4python" # Restricted to non-submit operations
 
 # Filesystem scoping for run_python.
 # Paths are relative to the workspace root (the --workspace directory or CWD).
@@ -96,6 +96,9 @@ readable_paths = ["*"]
 '/\.pypirc$' = "deny-all"               # PyPI registry tokens — no library reader in sandbox
 '/\.git-credentials$' = "deny-all"       # Git plaintext passwords — no library reader in sandbox
 '/\.env(\.[^/]*)?$' = "workspace"        # .env files — workspace only
+'/\.kiro/agent' = "deny-all"             # Kiro agent config — prevent self-modification
+'/\.kiro/settings' = "deny-all"          # Kiro settings — prevent self-modification
+'/\.claude/settings' = "deny-all"        # Claude settings — prevent self-modification
 
 # AST-level static analysis — blocks dangerous constructs before execution.
 # These prevent trivial jailbreaks (e.g. eval("__import__('os').system(...)")).
@@ -217,3 +220,28 @@ allow = [
 #mode = "allow"
 #deny = []
 #arg_paths = "workspace"
+
+# Custom denial hints — appended to rejection messages when the pattern matches
+# the attempted action. These do NOT define new deny rules; they only provide
+# better guidance after a rejection has already occurred.
+#
+# Match targets by rejection type:
+#   Shell command rejection  → command string (e.g. "aws", "aws.exe", "curl")
+#   Shell args rejection     → "command args..." (e.g. "git push origin main")
+#   Import rejection         → full module name (e.g. "requests", "paramiko.client")
+#   Restriction rejection    → "module.attribute" (e.g. "boto3.resource", "polars.write_csv")
+#
+# Regex uses re.search() against the attempted value. First match wins.
+[deny_messages]
+"^aws(\\.exe)?$" = "AWS CLI is not allowed. Use `import boto3` in run_python instead (client factory with read-only restrictions)."
+"^git push" = "git push is not allowed. Stage changes locally and leave pushing for human review."
+"^git remote" = "git remote is not allowed. Remote configuration cannot be modified from the sandbox."
+"^git " = "This git operation is not in the allowed list. Operations should be limited to side effects within the local workspace."
+"^p4 submit" = "p4 submit is not allowed. Use `p4 shelve` to stage changes for human review."
+"^p4 " = "This p4 operation is not in the allowed list. Operations should be limited to side effects within the local workspace."
+"^requests(\\.|$)" = "Open network access is not permitted in pyddock. Use a different tool if available (e.g. web_fetch)."
+"^paramiko(\\.|$)" = "SSH access is not permitted in pyddock. Use a different tool for remote operations."
+"^boto3\\.(resource|Resource)" = "Only boto3.client() is allowed (not resource/Session). Use boto3.client('<service>') to create service clients."
+"^polars\\.(write_|sink_)" = "Polars write/sink operations are blocked. Write output files using Python builtins (open/pathlib) in run_python instead."
+"^(bash|sh)(\\.exe)?$" = "Shell interpreters are not allowed. Write your logic directly in run_python, or use run_shell with an approved command."
+"^(powershell|pwsh)(\\.exe)?$" = "PowerShell is not allowed. Write your logic directly in run_python, or use run_shell with an approved command."
