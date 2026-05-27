@@ -177,12 +177,35 @@ class _ImportBlocker:
         return True
 
 
+# Internal state for MethodFilterProxy instances. Stored here (not on
+# proxy instances) so agent code cannot extract it via object.__getattribute__.
+# The pyddock._runtime module is not importable by agent code.
+_MFP_STATE: dict[int, tuple] = {}
+
+# Dunders that are BLOCKED on MethodFilterProxy and FactoryProxy.
+# These enable bypass of the allow-pattern filtering if passed through.
+# All other dunders are allowed (needed for repr, str, iter, context managers, etc.).
+_BLOCKED_DUNDERS = frozenset({
+    "__getattribute__",  # wrapped.__getattribute__("run_submit") bypasses proxy
+    "__getattr__",       # wrapped.__getattr__("run_submit") bypasses proxy
+    "__dict__",          # exposes raw instance attributes
+    "__reduce__",        # pickle protocol could serialize/deserialize unwrapped
+    "__reduce_ex__",     # pickle protocol could serialize/deserialize unwrapped
+})
+
+
 class MethodFilterProxy:
     """Proxy that intercepts attribute access and blocks disallowed methods.
 
     Used by FactoryProxy to wrap objects returned by factory functions.
     Only methods matching at least one allow pattern are permitted.
+
+    Internal state (wrapped object, patterns) is stored in the module-level
+    _MFP_STATE dict, NOT on the instance. This prevents agent code from
+    extracting the raw wrapped object via object.__getattribute__.
     """
+
+    __slots__ = ()
 
     def __init__(
         self,
@@ -191,17 +214,25 @@ class MethodFilterProxy:
         deny_messages: list[tuple[re.Pattern[str], str]] | None = None,
         module_name: str = "",
     ) -> None:
-        object.__setattr__(self, "_wrapped", wrapped)
-        object.__setattr__(self, "_allow_patterns", allow_patterns)
-        object.__setattr__(self, "_deny_messages", deny_messages or [])
-        object.__setattr__(self, "_module_name", module_name)
+        _MFP_STATE[id(self)] = (wrapped, allow_patterns, deny_messages or [], module_name)
 
-    def __getattr__(self, name: str) -> Any:
-        allow_patterns = object.__getattribute__(self, "_allow_patterns")
-        wrapped = object.__getattribute__(self, "_wrapped")
+    def __del__(self) -> None:
+        _MFP_STATE.pop(id(self), None)
+
+    def __getattribute__(self, name: str) -> Any:
+        state = _MFP_STATE.get(id(self))
+        if state is None:
+            raise RuntimeError("MethodFilterProxy: internal state missing")
+        wrapped, allow_patterns, deny_messages, module_name = state
 
         if name.startswith("__") and name.endswith("__"):
-            # Allow dunder access for internal Python machinery (repr, str, etc.)
+            # Block dangerous dunders that enable proxy bypass
+            if name in _BLOCKED_DUNDERS:
+                raise PermissionError(
+                    f"PermissionError: access to '{name}' is not permitted "
+                    f"on restricted objects."
+                )
+            # Allow safe dunders for internal Python machinery (repr, str, etc.)
             return getattr(wrapped, name)
 
         if not any(p.match(name) for p in allow_patterns):
@@ -211,8 +242,6 @@ class MethodFilterProxy:
                 f"Allowed method patterns: {patterns_str}. "
                 f"Please use one of the allowed methods instead."
             )
-            deny_messages = object.__getattribute__(self, "_deny_messages")
-            module_name = object.__getattribute__(self, "_module_name")
             attempted = f"{module_name}.{name}" if module_name else name
             hint = _find_deny_hint(attempted, deny_messages)
             if hint:
@@ -221,12 +250,29 @@ class MethodFilterProxy:
         return getattr(wrapped, name)
 
 
-class FactoryProxy:
-    """Wraps a factory function to return proxied objects.
+# Internal state for FactoryProxy instances. Stored here (not on proxy
+# instances) so agent code cannot extract the original factory/class via
+# proxy.__dict__["_original"] or object.__getattribute__(proxy, "_original").
+_FP_STATE: dict[int, tuple] = {}
 
-    Objects returned by the factory are wrapped in MethodFilterProxy,
-    which enforces the allow-pattern list on method access.
+
+class FactoryProxy:
+    """Wraps a factory function or class to return proxied objects.
+
+    Objects returned by the factory (or class constructor) are wrapped in
+    MethodFilterProxy, which enforces the allow-pattern list on method access.
+
+    When wrapping a class, also supports:
+    - __getattr__: Proxies class-level attribute access (e.g. classmethods)
+      with the same allow-pattern filtering applied.
+    - __instancecheck__: Supports isinstance() checks against the wrapped class.
+
+    Internal state is stored in the module-level _FP_STATE dict to prevent
+    agent code from accessing the original factory via __dict__ or
+    object.__getattribute__.
     """
+
+    __slots__ = ()
 
     def __init__(
         self,
@@ -235,16 +281,78 @@ class FactoryProxy:
         deny_messages: list[tuple[re.Pattern[str], str]] | None = None,
         module_name: str = "",
     ) -> None:
-        self._original = original_factory
-        self._allow_patterns = allow_patterns
-        self._deny_messages = deny_messages or []
-        self._module_name = module_name
+        is_class = isinstance(original_factory, type)
+        _FP_STATE[id(self)] = (original_factory, allow_patterns, deny_messages or [], module_name, is_class)
+
+    def __del__(self) -> None:
+        _FP_STATE.pop(id(self), None)
 
     def __call__(self, *args: Any, **kwargs: Any) -> MethodFilterProxy:
-        obj = self._original(*args, **kwargs)
-        return MethodFilterProxy(
-            obj, self._allow_patterns, self._deny_messages, self._module_name
-        )
+        state = _FP_STATE.get(id(self))
+        if state is None:
+            raise RuntimeError("FactoryProxy: internal state missing")
+        original, allow_patterns, deny_messages, module_name, _is_class = state
+        obj = original(*args, **kwargs)
+        return MethodFilterProxy(obj, allow_patterns, deny_messages, module_name)
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy attribute access to the wrapped class with filtering.
+
+        Only applies when wrapping a class (for classmethods, constants, etc.).
+        Applies the same class_allow patterns to prevent access to restricted
+        methods via the class object itself.
+        """
+        state = _FP_STATE.get(id(self))
+        if state is None:
+            raise RuntimeError("FactoryProxy: internal state missing")
+        original, allow_patterns, deny_messages, module_name, is_class = state
+
+        if not is_class:
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+
+        # Block dangerous dunders that enable bypass
+        if name.startswith("__") and name.endswith("__"):
+            if name in _BLOCKED_DUNDERS:
+                raise PermissionError(
+                    f"PermissionError: access to '{name}' is not permitted "
+                    f"on restricted objects."
+                )
+            # Allow safe dunders for Python machinery
+            return getattr(original, name)
+
+        # Apply the same allow-pattern filtering as MethodFilterProxy
+        if not any(p.match(name) for p in allow_patterns):
+            patterns_str = ", ".join(p.pattern for p in allow_patterns)
+            msg = (
+                f"PermissionError: '{name}' is not permitted. "
+                f"Allowed method patterns: {patterns_str}. "
+                f"Please use one of the allowed methods instead."
+            )
+            attempted = f"{module_name}.{name}" if module_name else name
+            hint = _find_deny_hint(attempted, deny_messages)
+            if hint:
+                msg += f"\n[{hint}]"
+            raise PermissionError(msg)
+
+        return getattr(original, name)
+
+    def __instancecheck__(self, instance: Any) -> bool:
+        """Support isinstance() checks against the wrapped class."""
+        state = _FP_STATE.get(id(self))
+        if state is None:
+            return NotImplemented
+        original, _allow_patterns, _deny_messages, _module_name, is_class = state
+        if is_class:
+            # Unwrap MethodFilterProxy instances for isinstance checks
+            if isinstance(instance, MethodFilterProxy):
+                mfp_state = _MFP_STATE.get(id(instance))
+                if mfp_state is not None:
+                    wrapped = mfp_state[0]
+                    return isinstance(wrapped, original)
+            return isinstance(instance, original)
+        return NotImplemented
 
 
 def _expand_patterns(
@@ -1648,14 +1756,19 @@ class RuntimeEnforcement:
                 if class_allow:
                     # For each allowed callable attr, wrap it in FactoryProxy
                     # so objects it returns are restricted to class_allow patterns.
+                    # Classes are wrapped too (they're callable constructors),
+                    # except BaseException subclasses which are never factories.
                     compiled_class_patterns = [re.compile(p) for p in class_allow]
                     for attr_name in always_allowed:
                         attr = getattr(module, attr_name, None)
-                        if attr is not None and callable(attr) and not isinstance(attr, type):
-                            custom_attrs[attr_name] = FactoryProxy(
-                                attr, compiled_class_patterns,
-                                self._deny_messages, module_name,
-                            )
+                        if attr is None or not callable(attr):
+                            continue
+                        if isinstance(attr, type) and issubclass(attr, BaseException):
+                            continue
+                        custom_attrs[attr_name] = FactoryProxy(
+                            attr, compiled_class_patterns,
+                            self._deny_messages, module_name,
+                        )
 
                 proxy = _CallerScopedModuleProxy(
                     module_name=module_name,

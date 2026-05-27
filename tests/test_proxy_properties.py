@@ -67,7 +67,7 @@ def test_proxy_allows_matching_methods(method: str, patterns: list[str]) -> None
     assume(any(p.match(method) for p in compiled))
 
     proxy = MethodFilterProxy(_FakeClient(), compiled)
-    result = proxy.__getattr__(method)
+    result = getattr(proxy, method)
     assert result == f"result_of_{method}"
 
 
@@ -85,7 +85,7 @@ def test_proxy_blocks_non_matching_methods(method: str, patterns: list[str]) -> 
 
     proxy = MethodFilterProxy(_FakeClient(), compiled)
     with pytest.raises(PermissionError) as exc_info:
-        proxy.__getattr__(method)
+        getattr(proxy, method)
 
     # Error message includes the method name and allowed patterns
     msg = str(exc_info.value)
@@ -99,7 +99,7 @@ def test_proxy_with_empty_allow_blocks_everything(method: str) -> None:
     """With no allow patterns, all methods are blocked."""
     proxy = MethodFilterProxy(_FakeClient(), [])
     with pytest.raises(PermissionError):
-        proxy.__getattr__(method)
+        getattr(proxy, method)
 
 
 @given(method=method_names)
@@ -107,7 +107,7 @@ def test_proxy_with_empty_allow_blocks_everything(method: str) -> None:
 def test_proxy_with_wildcard_allows_everything(method: str) -> None:
     """With .* pattern, all methods are allowed."""
     proxy = MethodFilterProxy(_FakeClient(), [re.compile(".*")])
-    result = proxy.__getattr__(method)
+    result = getattr(proxy, method)
     assert result == f"result_of_{method}"
 
 
@@ -121,7 +121,7 @@ def test_proxy_allows_dunder_methods() -> None:
     result = proxy.__repr__
     # _internal should be blocked (not a dunder)
     with pytest.raises(PermissionError):
-        proxy.__getattr__("_internal")
+        getattr(proxy, "_internal")
 
 
 def test_proxy_error_message_includes_patterns() -> None:
@@ -130,7 +130,7 @@ def test_proxy_error_message_includes_patterns() -> None:
     proxy = MethodFilterProxy(_FakeClient(), patterns)
 
     with pytest.raises(PermissionError) as exc_info:
-        proxy.__getattr__("delete_bucket")
+        getattr(proxy, "delete_bucket")
 
     msg = str(exc_info.value)
     assert "list_.*" in msg

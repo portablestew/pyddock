@@ -145,7 +145,7 @@ class_allow = [
     "run_edit", "run_add", "run_delete", "run_revert",
     "run_sync", "run_reconcile", "run_resolve",
     "run_shelve", "run_unshelve",
-    "run_integrate", "run_move",
+    "run_integrate", "run_move", "run_reopen",
     # Changelist management (not submit)
     "run_change",
     # Spec reading
@@ -208,7 +208,7 @@ allow = [
     "edit.*", "add.*", "delete.*", "revert.*",
     "sync.*", "reconcile.*", "resolve.*",
     "shelve.*", "unshelve.*",
-    "integrate.*", "move.*",
+    "integrate.*", "move.*", "reopen.*",
     # Changelist management (not submit)
     "change.*",
 ]
@@ -246,3 +246,4 @@ allow = [
 "^polars\\.(write_|sink_)" = "Polars write/sink operations are blocked. Write output files using Python builtins (open/pathlib) in run_python instead."
 "^(bash|sh)(\\.exe)?$" = "Shell interpreters are not allowed. Write your logic directly in run_python, or use run_shell with an approved command."
 "^(powershell|pwsh)(\\.exe)?$" = "PowerShell is not allowed. Write your logic directly in run_python, or use run_shell with an approved command."
+"^python(\\.exe)?$" = "Python is restricted to the run_python sandbox. Use the available runtime features."
