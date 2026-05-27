@@ -198,6 +198,26 @@ class RuntimeEnforcement:
         except ImportError:
             pass
 
+        # Pre-warmed stdlib internals that are allowed to be re-imported from
+        # sys.modules cache. These are lazily imported by frozen stdlib modules
+        # (e.g. _strptime by datetime.strptime) and would be blocked by the
+        # trusted-caller check due to frozen frame chain issues in Python 3.12+.
+        _prewarmed_internals = set()
+
+        # Warm up lazy stdlib imports that are triggered by frozen modules.
+        # In Python 3.12+, many stdlib modules are frozen (compiled into the
+        # interpreter). When they lazily import internal modules (e.g. datetime
+        # importing _strptime on first strptime() call), the frozen frame chain
+        # can confuse the trusted-caller check. Pre-importing them here caches
+        # them in sys.modules, and _guarded_import allows re-import of these
+        # specific modules without re-validating the call stack.
+        try:
+            import datetime as _dt_warmup
+            _dt_warmup.datetime.strptime("2000", "%Y")  # triggers _strptime import
+            _prewarmed_internals.add("_strptime")
+        except Exception:
+            pass
+
         blocker = _ImportBlocker(allowed, trusted_prefixes_tuple, self._deny_messages)
         # Insert at the beginning so it's checked first
         sys.meta_path.insert(0, blocker)
@@ -242,6 +262,12 @@ class RuntimeEnforcement:
                 if "." in name:
                     _proxy_module_universal(name, _trusted, _skip_proxy, _ws_module_names)
                 return result
+            # If the module was explicitly pre-warmed as a stdlib internal
+            # (e.g. _strptime), allow re-import from cache. These are lazily
+            # imported by frozen stdlib modules and would be blocked by the
+            # trusted-caller check due to frozen frame chain issues.
+            if name in _prewarmed_internals and name in sys.modules:
+                return _ORIGINALS["import"](name, *args, **kwargs)
             # If we're inside the loading of an allowed module AND the
             # immediate caller is frozen import machinery, permit the import.
             # This narrowly handles internal machinery needs (codec loading,

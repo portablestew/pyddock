@@ -60,8 +60,7 @@ subprocess = true
 sys = true
 tempfile = true
 # Third-party — controlled via [restrictions] sections below
-#boto3 = true # Enable for AWS (opens network access vectors, when with reasonable restrictions)
-dateutil = "python-dateutil"
+boto3 = true # Enable for AWS (opens network access vectors, when with reasonable restrictions)
 git = "GitPython" # Shell policy enforces command restrictions via Popen
 polars = true
 P4 = "p4python" # Restricted to non-submit operations
@@ -247,3 +246,4 @@ allow = [
 "^(bash|sh)(\\.exe)?$" = "Shell interpreters are not allowed. Write your logic directly in run_python, or use run_shell with an approved command."
 "^(powershell|pwsh)(\\.exe)?$" = "PowerShell is not allowed. Write your logic directly in run_python, or use run_shell with an approved command."
 "^python(\\.exe)?$" = "Python is restricted to the run_python sandbox. Use the available runtime features."
+"^dateutil(\\.|$)" = "dateutil is not directly available. Use `datetime.fromisoformat()` for ISO 8601 parsing, or `datetime.strptime()` for custom formats."

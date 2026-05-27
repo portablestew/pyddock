@@ -24,22 +24,39 @@ def _is_infra_frame(filename: str) -> bool:
 
     These frames are skipped during stack inspection — they're not
     considered "the real caller" of an import.
+
+    Only frozen importlib frames are skipped (they're the import machinery).
+    Other frozen stdlib modules (e.g. <frozen datetime>) are NOT skipped —
+    they're handled as trusted frames in _caller_is_trusted.
     """
     return (
-        filename.startswith("<frozen")
+        filename.startswith("<frozen importlib")
         or filename.startswith(_PYDDOCK_DIR)
     )
+
+
+def _is_frozen_stdlib(filename: str) -> bool:
+    """Return True if the frame is a frozen stdlib module (not importlib).
+
+    Frozen stdlib modules have filenames like '<frozen datetime>',
+    '<frozen os>', '<frozen posixpath>'. Their bytecode is immutable —
+    they can only import what's hardcoded in CPython source. Treating
+    them as trusted is safe because agent code cannot influence what
+    they import.
+    """
+    return filename.startswith("<frozen") and not filename.startswith("<frozen importlib")
 
 
 def _caller_is_trusted(trusted_prefixes: tuple[str, ...]) -> bool:
     """Check if the import call originates from trusted code.
 
     Walks the entire call stack. If any frame between the import guard and
-    the agent snippet belongs to trusted code (workspace module or
-    site-packages), the import is allowed. If the agent snippet is reached
-    with no trusted frame found, the import is blocked.
+    the agent snippet belongs to trusted code (workspace module,
+    site-packages, or frozen stdlib), the import is allowed. If the agent
+    snippet is reached with no trusted frame found, the import is blocked.
 
     Infrastructure frames (frozen importlib, pyddock enforcement) are skipped.
+    Frozen stdlib frames (e.g. <frozen datetime>) are treated as trusted.
     All other frames are checked against trusted_prefixes or SNIPPET_FILENAME.
     """
     frame = sys._getframe(1)
@@ -48,6 +65,12 @@ def _caller_is_trusted(trusted_prefixes: tuple[str, ...]) -> bool:
         filename = frame.f_code.co_filename
         # Skip import machinery and pyddock enforcement frames
         if _is_infra_frame(filename):
+            frame = frame.f_back
+            continue
+        # Frozen stdlib modules are trusted (immutable bytecode, can only
+        # import what's hardcoded in CPython source)
+        if _is_frozen_stdlib(filename):
+            found_trusted = True
             frame = frame.f_back
             continue
         # Agent snippet code — verdict based on whether we found trusted code
