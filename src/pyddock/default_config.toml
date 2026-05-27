@@ -60,7 +60,7 @@ subprocess = true
 sys = true
 tempfile = true
 # Third-party — controlled via [restrictions] sections below
-boto3 = true # Enable for AWS (opens network access vectors, when with reasonable restrictions)
+#boto3 = true # Enable for AWS (opens network access vectors, when with reasonable restrictions)
 git = "GitPython" # Shell policy enforces command restrictions via Popen
 polars = true
 P4 = "p4python" # Restricted to non-submit operations

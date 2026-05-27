@@ -24,6 +24,7 @@ from pyddock._proxies import (
 )
 from pyddock._fs_enforcement import apply_filesystem_scoping
 from pyddock._subprocess_patch import apply_subprocess_patch
+from pyddock._prewarm import run_all as _run_prewarms
 
 
 class RuntimeEnforcement:
@@ -184,39 +185,11 @@ class RuntimeEnforcement:
         )
         self._trusted_prefixes = trusted_prefixes_tuple
 
-        # Warm up codecs that may be lazily loaded after the hook activates.
-        # Codec lookups trigger imports (e.g. encodings.idna → stringprep)
-        # that would be blocked by the pure allowlist. Pre-loading them here
-        # caches everything before the hook is installed.
-        try:
-            import codecs
-            for codec_name in ("idna", "utf-8", "ascii", "latin-1", "cp1252", "utf-16-le"):
-                try:
-                    codecs.lookup(codec_name)
-                except LookupError:
-                    pass
-        except ImportError:
-            pass
-
         # Pre-warmed stdlib internals that are allowed to be re-imported from
         # sys.modules cache. These are lazily imported by frozen stdlib modules
         # (e.g. _strptime by datetime.strptime) and would be blocked by the
         # trusted-caller check due to frozen frame chain issues in Python 3.12+.
-        _prewarmed_internals = set()
-
-        # Warm up lazy stdlib imports that are triggered by frozen modules.
-        # In Python 3.12+, many stdlib modules are frozen (compiled into the
-        # interpreter). When they lazily import internal modules (e.g. datetime
-        # importing _strptime on first strptime() call), the frozen frame chain
-        # can confuse the trusted-caller check. Pre-importing them here caches
-        # them in sys.modules, and _guarded_import allows re-import of these
-        # specific modules without re-validating the call stack.
-        try:
-            import datetime as _dt_warmup
-            _dt_warmup.datetime.strptime("2000", "%Y")  # triggers _strptime import
-            _prewarmed_internals.add("_strptime")
-        except Exception:
-            pass
+        _prewarmed_internals = _run_prewarms()
 
         blocker = _ImportBlocker(allowed, trusted_prefixes_tuple, self._deny_messages)
         # Insert at the beginning so it's checked first
