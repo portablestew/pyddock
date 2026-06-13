@@ -212,6 +212,27 @@ allow = [
     "change.*",
 ]
 
+[shell.docker]
+# Compose-only policy: scoped to the workspace's docker-compose.yml.
+# No bare run/exec (shell-escape vectors), no push/login/save/export.
+mode = "deny"
+allow = [
+    # Compose lifecycle
+    "compose up.*", "compose down.*", "compose build.*",
+    "compose ps.*", "compose logs.*", "compose exec.*",
+    "compose run.*", "compose stop.*", "compose restart.*",
+    "compose pull.*", "compose config.*", "compose top.*",
+    "compose images.*", "compose port.*", "compose version.*",
+    # Container/image inspection (read-only)
+    "ps.*", "inspect.*", "logs.*", "top.*", "stats.*", "port.*",
+    "images.*", "image ls.*", "image inspect.*", "image history.*",
+    # Volume & network inspection (read-only)
+    "volume ls.*", "volume inspect.*",
+    "network ls.*", "network inspect.*",
+    # System info (read-only)
+    "system df.*", "version.*", "info.*",
+]
+
 # Path-like command patterns trigger automatic write protection — run_python cannot
 # write to directories matching these patterns, preventing write-then-execute escalation.
 # Script interpreter mapping is automatic: .ps1→powershell, .py→python, .sh→bash, .bat→cmd /c.
@@ -246,4 +267,5 @@ allow = [
 "^(bash|sh)(\\.exe)?$" = "Shell interpreters are not allowed. Write your logic directly in run_python, or use run_shell with an approved command."
 "^(powershell|pwsh)(\\.exe)?$" = "PowerShell is not allowed. Write your logic directly in run_python, or use run_shell with an approved command."
 "^python(\\.exe)?$" = "Python is restricted to the run_python sandbox. Use the available runtime features."
+"^docker " = "Only `docker compose` and read-only inspection commands are allowed. Use compose for container lifecycle."
 "^dateutil(\\.|$)" = "dateutil is not directly available. Use `datetime.fromisoformat()` for ISO 8601 parsing, or `datetime.strptime()` for custom formats."

@@ -190,6 +190,74 @@ def apply_subprocess_patch(
 
         return None
 
+    def _check_cwd(policy: dict, cwd: Any) -> str | None:
+        """Validate cwd kwarg against the same rules as arg paths.
+
+        Applies the policy's arg_paths mode to the cwd directory:
+        - "none": no restriction
+        - "protected": block cwd inside protected directories
+        - "workspace": block cwd outside the workspace or inside protected dirs
+
+        Returns None if cwd is permitted, or an error message string if blocked.
+        """
+        if cwd is None:
+            return None
+
+        arg_paths_mode = policy.get("arg_paths", "workspace")
+        if arg_paths_mode == "none":
+            return None
+
+        resolved = pathlib.Path(_real_os.path.abspath(str(cwd)))
+
+        # Check .pyddock/ (excluding .pyddock/tmp/)
+        try:
+            rel = resolved.relative_to(_pyddock_dir)
+            if not str(rel).startswith("tmp"):
+                return (
+                    f"cwd '{cwd}' targets the protected .pyddock/ directory. "
+                    f"Subprocess cwd cannot be set to .pyddock/ "
+                    f"(self-modification protection)."
+                )
+        except ValueError:
+            pass
+
+        # Check workspace module directories
+        for mod_name, ws_dir in _ws_module_dirs:
+            try:
+                resolved.relative_to(ws_dir)
+                return (
+                    f"cwd '{cwd}' targets workspace module directory "
+                    f"'{mod_name}'. Subprocess cwd cannot be set to workspace "
+                    f"module directories."
+                )
+            except ValueError:
+                continue
+
+        # Check shell script directories
+        for dir_label, script_dir in _shell_protected_dirs:
+            try:
+                resolved.relative_to(script_dir)
+                return (
+                    f"cwd '{cwd}' targets a shell-executable script "
+                    f"directory ({dir_label}). Subprocess cwd cannot be set "
+                    f"to script directories (write-then-execute prevention)."
+                )
+            except ValueError:
+                continue
+
+        # "workspace" mode: block cwd outside the workspace
+        if arg_paths_mode == "workspace":
+            try:
+                resolved.relative_to(_ws_root_abs)
+            except ValueError:
+                return (
+                    f"cwd '{cwd}' resolves to '{resolved}' which is outside "
+                    f"the workspace. Subprocess cwd is restricted to the "
+                    f"workspace directory (arg_paths = \"workspace\")."
+                )
+
+        return None
+
     def _validated_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
         """subprocess.run replacement that validates against shell policies."""
         # Reject shell=True
@@ -250,13 +318,23 @@ def apply_subprocess_patch(
             if hint:
                 msg += f"\n[{hint}]"
             raise PermissionError(msg)
+        # Check cwd against the same path rules
+        cwd_rejection = _check_cwd(policy, kwargs.get("cwd"))
+        if cwd_rejection is not None:
+            msg = f"PermissionError: {cwd_rejection}"
+            hint = _find_deny_hint(
+                f"{command} {' '.join(cmd_args)}", _deny_msgs_sp
+            )
+            if hint:
+                msg += f"\n[{hint}]"
+            raise PermissionError(msg)
         # Apply interpreter mapping (same as run_shell) and execute
         resolved = _resolve_cmd(command)
         full_cmd = resolved + cmd_args
         kwargs["shell"] = False
         return _ORIGINALS["subprocess.run"](full_cmd, *args, **kwargs)
 
-    def _validate_command(cmd: Any, caller: str) -> tuple[list[str], list[str]]:
+    def _validate_command(cmd: Any, caller: str, cwd: Any = None) -> tuple[list[str], list[str]]:
         """Shared validation for run() and Popen(). Returns (resolved_cmd, cmd_args).
 
         Raises PermissionError if the command is not permitted.
@@ -311,6 +389,15 @@ def apply_subprocess_patch(
             if hint:
                 msg += f"\n[{hint}]"
             raise PermissionError(msg)
+        cwd_rejection = _check_cwd(policy, cwd)
+        if cwd_rejection is not None:
+            msg = f"PermissionError: {cwd_rejection}"
+            hint = _find_deny_hint(
+                f"{command} {' '.join(cmd_args)}", _deny_msgs_sp
+            )
+            if hint:
+                msg += f"\n[{hint}]"
+            raise PermissionError(msg)
         resolved = _resolve_cmd(command)
         return resolved + cmd_args, cmd_args
 
@@ -328,7 +415,7 @@ def apply_subprocess_patch(
                     "Pass command as a list instead: "
                     f"subprocess.Popen(['{example_cmd}', 'arg1', 'arg2'])"
                 )
-            full_cmd, _ = _validate_command(cmd, "Popen")
+            full_cmd, _ = _validate_command(cmd, "Popen", cwd=kwargs.get("cwd"))
             kwargs["shell"] = False
             self._proc = _ORIGINALS["subprocess.Popen"](full_cmd, *args, **kwargs)
 
