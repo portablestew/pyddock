@@ -230,27 +230,48 @@ def _expand_patterns(
 def _compute_exported_api(
     module: types.ModuleType,
     *,
-    exclude_foreign_classes: bool = False,
+    exclude_foreign_classes: bool,
+    include_private: bool,
 ) -> frozenset[str]:
     """Determine which attributes constitute a module's public API.
 
     Algorithm:
-    1. If module defines __all__, use exactly those names.
-    2. Otherwise, include all attributes that are NOT instances of
-       types.ModuleType (excludes re-exported imports like `os`, `sys`).
-       Also exclude private names (starting with _).
+    1. If module defines __all__, seed the result with those names.
+    2. Otherwise (or additionally when include_private is True), include all
+       attributes that are NOT instances of types.ModuleType (excludes
+       re-exported imports like `os`, `sys`). Dunder names are always skipped
+       here (module metadata dunders are attached separately by the proxy).
     3. If exclude_foreign_classes is True, also exclude classes whose
        __module__ belongs to a different top-level package.
-    """
-    if hasattr(module, "__all__"):
-        return frozenset(module.__all__)
 
+    include_private:
+        When False (default), single-underscore private names are excluded —
+        agent code only sees the public API. Used for pre-enforcement modules
+        (imported at startup before the os/sys proxies were installed) which
+        may hold real os/sys references.
+        When True, single-underscore private non-module attributes are also
+        included. Used ONLY for post-enforcement modules (imported lazily by
+        agent code after enforcement was active), whose internal references
+        already resolve to the safe os/sys proxies and therefore cannot leak
+        dangerous capabilities. This is required so native extensions (e.g.
+        cryptography's Rust bindings) can read their module-private constants
+        through the proxy via sys.modules.
+    """
     module_name = getattr(module, "__name__", "") or ""
     top_level_pkg = module_name.split(".")[0]
 
     exported: set[str] = set()
+
+    if hasattr(module, "__all__"):
+        exported |= set(module.__all__)
+        if not include_private:
+            return frozenset(exported)
+
     for name in dir(module):
-        if name.startswith("_"):
+        # Dunder names are handled separately (proxy attaches metadata dunders).
+        if name.startswith("__") and name.endswith("__"):
+            continue
+        if name.startswith("_") and not include_private:
             continue
         val = getattr(module, name, None)
         if isinstance(val, types.ModuleType):
@@ -456,6 +477,8 @@ def _proxy_module_universal(
     trusted_prefixes: tuple[str, ...],
     skip_modules: frozenset[str],
     workspace_module_names: frozenset[str] = frozenset(),
+    *,
+    include_private: bool,
 ) -> None:
     """Wrap a module in a caller-scoped proxy (universal mode).
 
@@ -463,6 +486,14 @@ def _proxy_module_universal(
     is the module's exported API (non-ModuleType, non-private attrs).
     Trusted code (stdlib, site-packages, workspace) can access anything.
     Agent code can only access the exported API.
+
+    include_private:
+        When True, single-underscore private non-module attributes are also
+        exposed to agent code. This is safe ONLY for post-enforcement modules
+        (lazily imported after the os/sys proxies were installed) and is
+        required so native extensions can read their module-private constants
+        through the proxy. It is force-disabled for workspace modules, whose
+        private attributes could hold foreign network-capable objects.
     """
     module = sys.modules.get(name)
     if module is None or isinstance(module, _CallerScopedModuleProxy):
@@ -475,9 +506,15 @@ def _proxy_module_universal(
 
     # Compute the exported API — these attrs are always accessible to agent code.
     # Workspace modules get stricter filtering: foreign classes are excluded
-    # to prevent leakage of network-capable factories (e.g. Jira, SSHClient).
+    # to prevent leakage of network-capable factories (e.g. Jira, SSHClient),
+    # and private attributes are never exposed.
     is_workspace = top_level in workspace_module_names
-    always_allowed = _compute_exported_api(module, exclude_foreign_classes=is_workspace)
+    effective_private = include_private and not is_workspace
+    always_allowed = _compute_exported_api(
+        module,
+        exclude_foreign_classes=is_workspace,
+        include_private=effective_private,
+    )
 
     # Include already-loaded submodule names so `import json; json.decoder` works
     prefix = name + "."

@@ -18,6 +18,7 @@ max_timeout = 3600
 # Standard library — safe, no unpatched I/O
 abc = true
 argparse = true
+ast = true
 base64 = true
 collections = true
 contextlib = true
@@ -61,6 +62,7 @@ sys = true
 tempfile = true
 # Third-party — controlled via [restrictions] sections below
 #boto3 = true # Enable for AWS (opens network access vectors, when with reasonable restrictions)
+cryptography = true # No I/O of its own; all file access goes through Python builtins
 git = "GitPython" # Shell policy enforces command restrictions via Popen
 polars = true
 P4 = "p4python" # Restricted to non-submit operations

@@ -606,7 +606,7 @@ class TestComputeExportedApi:
         module._private = lambda: None
         module.__all__ = ["foo", "bar"]
 
-        result = _compute_exported_api(module)
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
         assert result == frozenset({"foo", "bar"})
 
     def test_all_includes_private_names_if_listed(self) -> None:
@@ -619,7 +619,7 @@ class TestComputeExportedApi:
         module.public = lambda: None
         module.__all__ = ["_internal", "public"]
 
-        result = _compute_exported_api(module)
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
         assert result == frozenset({"_internal", "public"})
 
     def test_excludes_module_type_attrs_without_all(self) -> None:
@@ -634,7 +634,7 @@ class TestComputeExportedApi:
         module.os = types.ModuleType("os")
         module.sys = types.ModuleType("sys")
 
-        result = _compute_exported_api(module)
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
         assert "my_func" in result
         assert "MY_CONST" in result
         assert "os" not in result
@@ -650,7 +650,7 @@ class TestComputeExportedApi:
         module._private_func = lambda: None
         module.__dunder = "something"
 
-        result = _compute_exported_api(module)
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
         assert "public_func" in result
         assert "_private_func" not in result
         assert "__dunder" not in result
@@ -663,7 +663,7 @@ class TestComputeExportedApi:
         module = types.ModuleType("fake")
         module.x = 1
 
-        result = _compute_exported_api(module)
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
         assert isinstance(result, frozenset)
 
     def test_empty_module_returns_empty(self) -> None:
@@ -675,7 +675,7 @@ class TestComputeExportedApi:
         # ModuleType has some default attrs like __name__, __doc__ etc.
         # but they all start with _ so should be excluded
 
-        result = _compute_exported_api(module)
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
         # Should be empty (no public non-module attrs added)
         assert result == frozenset()
 
@@ -688,5 +688,76 @@ class TestComputeExportedApi:
         module.submod = types.ModuleType("submod")
         module.__all__ = ["submod"]
 
-        result = _compute_exported_api(module)
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
         assert "submod" in result
+
+    def test_include_private_exposes_private_non_module_attrs(self) -> None:
+        """include_private=True adds single-underscore non-module attributes.
+
+        This is required so native extensions (e.g. cryptography's Rust
+        bindings) can read module-private constants through the proxy.
+        """
+        import types
+        from pyddock._runtime import _compute_exported_api
+
+        module = types.ModuleType("fake")
+        module.public = 1
+        module._PRIVATE_CONST = {"k": "v"}
+
+        default = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
+        assert "_PRIVATE_CONST" not in default
+
+        with_private = _compute_exported_api(module, exclude_foreign_classes=False, include_private=True)
+        assert "public" in with_private
+        assert "_PRIVATE_CONST" in with_private
+
+    def test_include_private_still_excludes_module_type(self) -> None:
+        """include_private must NOT expose ModuleType attrs (leakage guard).
+
+        Even private module references (e.g. a leaked `os`) stay excluded so
+        agent code cannot reach a usable os/sys through a private alias.
+        """
+        import types
+        from pyddock._runtime import _compute_exported_api
+
+        module = types.ModuleType("fake")
+        module._leaked_os = types.ModuleType("os")
+        module._data = 42
+
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=True)
+        assert "_leaked_os" not in result
+        assert "_data" in result
+
+    def test_include_private_skips_dunders(self) -> None:
+        """include_private exposes single-underscore names but not dunders."""
+        import types
+        from pyddock._runtime import _compute_exported_api
+
+        module = types.ModuleType("fake")
+        module._single = 1
+        module.__weird_dunder__ = 2
+
+        result = _compute_exported_api(module, exclude_foreign_classes=False, include_private=True)
+        assert "_single" in result
+        assert "__weird_dunder__" not in result
+
+    def test_include_private_with_all_unions_private_attrs(self) -> None:
+        """With __all__ present, include_private unions private non-module attrs.
+
+        Default behavior returns __all__ verbatim; include_private also scans
+        for private constants the native layer may need.
+        """
+        import types
+        from pyddock._runtime import _compute_exported_api
+
+        module = types.ModuleType("fake")
+        module.PublicThing = 1
+        module._PRIVATE_CONST = {"k": "v"}
+        module.__all__ = ["PublicThing"]
+
+        default = _compute_exported_api(module, exclude_foreign_classes=False, include_private=False)
+        assert default == frozenset({"PublicThing"})
+
+        with_private = _compute_exported_api(module, exclude_foreign_classes=False, include_private=True)
+        assert "PublicThing" in with_private
+        assert "_PRIVATE_CONST" in with_private

@@ -654,3 +654,152 @@ class TestWorkspaceModuleLeakageBlocked:
         assert result.exit_code == 0
         assert "BLOCKED" in result.stdout
         assert "SHOULD NOT REACH" not in result.stdout
+
+
+class TestReExportingPackageProxy:
+    """Regression tests for proxying packages whose __init__.py re-exports.
+
+    A package whose __init__.py does `from <pkg> import <submodule>` triggers
+    a re-entrant import of <pkg> while it is still initializing. The proxy must
+    be installed only after the outermost import completes, so it captures the
+    full public API (__all__) — not a partially-initialized snapshot. This is
+    the exact pattern used by cryptography.x509 (re-exports from submodules and
+    runs `from cryptography.x509 import oid, ...` during its own init).
+    """
+
+    @pytest.fixture
+    def workspace_with_reexport_pkg(self, workspace: Path) -> Path:
+        """Create a workspace subpackage that re-exports during init.
+
+        reexport_pkg/sub/__init__.py mirrors the cryptography.x509 pattern:
+          1. `from reexport_pkg.sub import _impl` — re-entrant import of the
+             still-initializing subpackage.
+          2. Re-exports PublicThing/make_thing from the submodule.
+          3. Imports os (a leaked stdlib module) and defines __all__ AFTER the
+             imports — so a prematurely-created proxy would miss the public API.
+        """
+        pkg = workspace / "reexport_pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("# top-level package\n")
+        sub = pkg / "sub"
+        sub.mkdir()
+        (sub / "__init__.py").write_text(
+            "from __future__ import annotations\n"
+            "# Re-entrant import of this very subpackage during its own init.\n"
+            "from reexport_pkg.sub import _impl\n"
+            "from reexport_pkg.sub._impl import PublicThing, make_thing\n"
+            "import os  # leaked stdlib module - must stay inaccessible to agents\n"
+            "\n"
+            "# __all__ defined AFTER imports: a proxy created mid-init would not\n"
+            "# see these names.\n"
+            "__all__ = ['PublicThing', 'make_thing']\n"
+        )
+        (sub / "_impl.py").write_text(
+            "import os\n"
+            "\n"
+            "class PublicThing:\n"
+            "    value = 7\n"
+            "\n"
+            "def make_thing():\n"
+            "    return PublicThing()\n"
+        )
+        return workspace
+
+    def _make_executor_with_pkg_path(
+        self,
+        config: PyddockConfig,
+        venv_manager: VenvManager,
+        pkg_parent_path: Path,
+    ) -> SubprocessExecutor:
+        """Executor that injects the package parent dir onto the subprocess sys.path."""
+        executor = SubprocessExecutor(config, venv_manager)
+        original_build = executor._build_bootstrap
+
+        def _patched_build(source: str, args: list[str], workspace_root: Path) -> str:
+            bootstrap = original_build(source, args, workspace_root)
+            inject_line = f"sys.path.insert(0, {str(pkg_parent_path)!r})\n"
+            marker = "sys.argv = "
+            idx = bootstrap.find(marker)
+            if idx != -1:
+                end_of_line = bootstrap.find("\n", idx)
+                bootstrap = bootstrap[:end_of_line + 1] + inject_line + bootstrap[end_of_line + 1:]
+            return bootstrap
+
+        executor._build_bootstrap = _patched_build  # type: ignore[method-assign]
+        return executor
+
+    def test_reexported_public_api_is_accessible(
+        self, workspace_with_reexport_pkg: Path, venv_manager: VenvManager
+    ) -> None:
+        """Public API re-exported during init must be reachable on the proxy.
+
+        Without the timing fix, the proxy is created during the re-entrant
+        import (before __all__ is populated) and PublicThing/make_thing are
+        permanently hidden from agent code.
+        """
+        workspace = workspace_with_reexport_pkg
+
+        config = PyddockConfig(
+            execution=ExecutionConfig(timeout=30.0),
+            imports=ImportsConfig(
+                allowed=["reexport_pkg", "os"],
+                workspace={"reexport_pkg": "reexport_pkg"},
+            ),
+            filesystem=FilesystemConfig(writable_paths=["."], readable_paths=["*"]),
+            ast=ASTConfig(block_calls=[], block_attributes=[]),
+            restrictions={},
+        )
+        executor = self._make_executor_with_pkg_path(config, venv_manager, workspace)
+
+        source = (
+            "import reexport_pkg.sub as sub\n"
+            "for attr in ('PublicThing', 'make_thing'):\n"
+            "    print(('OK: ' if hasattr(sub, attr) else 'MISSING: ') + attr)\n"
+            "thing = sub.make_thing()\n"
+            "print(f'VALUE={thing.value}')\n"
+        )
+        result = executor.execute(source, [], 30, workspace)
+
+        assert result.exit_code == 0, result.stderr
+        assert "OK: PublicThing" in result.stdout
+        assert "OK: make_thing" in result.stdout
+        assert "VALUE=7" in result.stdout
+        assert "MISSING" not in result.stdout
+
+    def test_reexport_pkg_module_leakage_still_blocked(
+        self, workspace_with_reexport_pkg: Path, venv_manager: VenvManager
+    ) -> None:
+        """Fixing the proxy timing must NOT expose leaked stdlib modules.
+
+        reexport_pkg.sub imports os at module scope; it must stay inaccessible
+        to agent code (ModuleType leakage), even though the public API is now
+        correctly exposed.
+        """
+        workspace = workspace_with_reexport_pkg
+
+        config = PyddockConfig(
+            execution=ExecutionConfig(timeout=30.0),
+            imports=ImportsConfig(
+                allowed=["reexport_pkg", "os"],
+                workspace={"reexport_pkg": "reexport_pkg"},
+            ),
+            filesystem=FilesystemConfig(writable_paths=["."], readable_paths=["*"]),
+            ast=ASTConfig(block_calls=[], block_attributes=[]),
+            restrictions={},
+        )
+        executor = self._make_executor_with_pkg_path(config, venv_manager, workspace)
+
+        source = (
+            "import reexport_pkg.sub as sub\n"
+            "try:\n"
+            "    leaked = sub.os\n"
+            "    print('LEAKED_OS')\n"
+            "except AttributeError as e:\n"
+            "    print(f'BLOCKED_OS: {e}')\n"
+        )
+        result = executor.execute(source, [], 30, workspace)
+
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED_OS" in result.stdout
+        assert "LEAKED" not in result.stdout
+

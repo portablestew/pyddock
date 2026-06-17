@@ -201,6 +201,12 @@ class RuntimeEnforcement:
         _ORIGINALS["import"] = builtins.__import__
         _trusted = trusted_prefixes_tuple
         _loading_depth = [0]  # reentrant counter: >0 while loading an allowed module
+        # Names whose import is currently in-flight. Used to detect re-entrant
+        # imports of the SAME module triggered by that module's own __init__.py
+        # (e.g. `from cryptography.x509 import oid` executed while x509/__init__.py
+        # is still running). Proxying a partially-initialized module would capture
+        # an incomplete public API, so we only proxy on the OUTERMOST import.
+        _loading_names: set[str] = set()
         # Modules that must NOT be wrapped by _proxy_module_universal:
         # os: plain types.ModuleType with safe attrs only (not a _CallerScopedModuleProxy)
         # sys: specialized caller-scoped proxy with custom_attrs
@@ -226,14 +232,32 @@ class RuntimeEnforcement:
                 # triggered by frozen import machinery during this load
                 # are allowed (e.g. _io for .pyc cache writing).
                 _loading_depth[0] += 1
+                # Is THIS call the outermost import of `name`? A nested
+                # re-entrant import of the same name (from the module's own
+                # __init__.py) must not proxy the partially-initialized module.
+                is_outermost = name not in _loading_names
+                if is_outermost:
+                    _loading_names.add(name)
                 try:
                     result = _ORIGINALS["import"](name, *args, **kwargs)
                 finally:
                     _loading_depth[0] -= 1
+                    if is_outermost:
+                        _loading_names.discard(name)
                 # Proxy ANY submodule import so agent code can't access
                 # leaked imports (e.g. pathlib.os, tempfile.os, json.decoder.os).
-                if "." in name:
-                    _proxy_module_universal(name, _trusted, _skip_proxy, _ws_module_names)
+                # Only proxy on the outermost import so the module's __init__.py
+                # has finished and its full public API (__all__) is populated.
+                # include_private=True: these modules were imported lazily AFTER
+                # the os/sys proxies were installed, so their internal references
+                # already resolve to safe proxies. Exposing their private
+                # non-module attrs is safe and lets native extensions read their
+                # module-private constants through the proxy via sys.modules.
+                if "." in name and is_outermost:
+                    _proxy_module_universal(
+                        name, _trusted, _skip_proxy, _ws_module_names,
+                        include_private=True,
+                    )
                 return result
             # If the module was explicitly pre-warmed as a stdlib internal
             # (e.g. _strptime), allow re-import from cache. These are lazily
@@ -321,7 +345,8 @@ class RuntimeEnforcement:
             if top not in self._allowed_set:
                 continue
             _proxy_module_universal(
-                mod_name, self._trusted_prefixes, skip_modules, workspace_module_names
+                mod_name, self._trusted_prefixes, skip_modules, workspace_module_names,
+                include_private=False,
             )
 
     def _install_safe_sys(self, trusted_prefixes: tuple[str, ...]) -> None:
@@ -429,7 +454,7 @@ class RuntimeEnforcement:
         # Safe functions (read-only operations)
         _safe_funcs = [
             "getcwd", "getpid", "getlogin",
-            "getenv",
+            "getenv", "urandom",
             "listdir", "scandir", "walk",
             "stat", "lstat", "fstat",
             "path",  # os.path submodule (pure path manipulation)
