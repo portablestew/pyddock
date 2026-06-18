@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 from pyddock._base import _ORIGINALS, _find_deny_hint
+from pyddock.shell_executor import evaluate_arg_policy
 
 
 def apply_subprocess_patch(
@@ -70,30 +71,28 @@ def apply_subprocess_patch(
         return None
 
     def _check_args_policy(policy: dict, cmd_args: list[str]) -> str | None:
-        """Validate args against policy. Returns error message or None."""
-        args_str = " ".join(cmd_args)
-        mode = policy.get("mode", "deny")
+        """Validate args against policy. Returns error message or None.
 
-        if mode == "deny":
-            allow_patterns = policy.get("allow", [])
-            if not allow_patterns:
-                return "No argument patterns are allowed for this command."
-            if not any(re.match(p, args_str) for p in allow_patterns):
-                allowed = ", ".join(allow_patterns)
-                return (
-                    f"Arguments '{args_str}' not permitted. "
-                    f"Allowed patterns: {allowed}"
-                )
+        Delegates to the shared evaluate_arg_policy() so this path stays in
+        lockstep with run_shell (ShellExecutor) and the GitPython guard.
+        """
+        args_str = " ".join(cmd_args)
+        reason = evaluate_arg_policy(
+            args_str,
+            mode=policy.get("mode", "deny"),
+            allow=policy.get("allow", []),
+            deny=policy.get("deny", []),
+        )
+        if reason is None:
             return None
-        elif mode == "allow":
-            deny_patterns = policy.get("deny", [])
-            for pattern in deny_patterns:
-                if re.match(pattern, args_str):
-                    return (
-                        f"Arguments '{args_str}' matched deny pattern '{pattern}'."
-                    )
-            return None
-        return None
+        if "deny pattern" in reason:
+            return f"Arguments '{args_str}' {reason}."
+        if "no argument patterns" in reason:
+            return "No argument patterns are allowed for this command."
+        allowed = ", ".join(policy.get("allow", []))
+        return (
+            f"Arguments '{args_str}' not permitted. Allowed patterns: {allowed}"
+        )
 
     # Pre-compute protected paths for arg scanning
     _ws_root = workspace_root

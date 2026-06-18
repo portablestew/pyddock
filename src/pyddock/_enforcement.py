@@ -25,6 +25,7 @@ from pyddock._proxies import (
 )
 from pyddock._fs_enforcement import apply_filesystem_scoping
 from pyddock._subprocess_patch import apply_subprocess_patch
+from pyddock._library_guards import apply_library_guards
 from pyddock._prewarm import run_all as _run_prewarms
 
 
@@ -92,6 +93,17 @@ class RuntimeEnforcement:
             io_module=self._io_module,
         )
         self.apply_restrictions()
+        # Per-library enforcement guards (the rare escape hatch for libraries the
+        # declarative imports/restrictions/shell tiers can't fully constrain).
+        # Each guard self-gates on its import being allowlisted. Run before
+        # install_module_proxies so target modules (e.g. git.cmd) are still real.
+        # GitPython is the first such guard: it captured `from subprocess import
+        # Popen` at import, so the subprocess proxy below can't see it — its guard
+        # hooks git.cmd.Git.execute and validates against [shell.git] instead.
+        apply_library_guards(
+            config=self._config,
+            deny_messages=self._deny_messages,
+        )
         apply_subprocess_patch(
             config=self._config,
             workspace_root=self._workspace_root,

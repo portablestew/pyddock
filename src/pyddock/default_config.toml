@@ -62,7 +62,7 @@ tempfile = true
 # Third-party — controlled via [restrictions] sections below
 #boto3 = true # Enable for AWS (opens network access vectors, even with reasonable restrictions)
 cryptography = true # No I/O of its own; all file access goes through Python builtins
-git = "GitPython" # Shell policy enforces command restrictions via Popen
+git = "GitPython" # [shell.git] policy enforced at the git.cmd.Git.execute chokepoint
 polars = true
 P4 = "p4python" # Restricted to non-submit operations
 
@@ -158,10 +158,12 @@ class_allow = [
     "fetch_.*", "iterate_.*",
 ]
 
+# GitPython shells out for all git operations, but captured `from subprocess
+# import Popen` at import — so the subprocess proxy can't see it. The [shell.git]
+# policy is instead enforced at GitPython's git.cmd.Git.execute chokepoint (see
+# _gitpython_patch.py). This restriction just limits which module-level classes
+# are accessible.
 [restrictions.git]
-# GitPython shells out via subprocess.Popen for all git operations.
-# The [shell.git] policy enforces which commands are permitted (no push/remote/config).
-# This restriction just limits which module-level classes are accessible.
 mode = "deny"
 module_allow = ["Repo", "InvalidGitRepositoryError", "GitCommandError", "NoSuchPathError"]
 class_allow = [".*"]
@@ -174,8 +176,11 @@ class_allow = [".*"]
 # Fields:
 #   command  — regex matched against the command string (defaults to ^<name>$ if omitted)
 #   mode     — "deny" (block all args except allow patterns) or "allow" (permit all except deny)
-#   allow    — regex patterns for permitted arg strings (used with mode = "deny")
-#   deny     — regex patterns for blocked arg strings (used with mode = "allow")
+#   allow    — regex patterns for permitted arg strings (mode = "deny"); matched with re.match
+#   deny     — regex patterns that ALWAYS reject when matched, in either mode. Checked
+#              before allow and searched ANYWHERE in the arg string (re.search), so a
+#              dangerous token can't hide mid-command behind an allowed prefix. Use for
+#              tokens unsafe regardless of subcommand (e.g. git's ext:: transport).
 #   arg_paths — path scanning for arguments that look like filesystem paths:
 #       "workspace" (default) — block args resolving outside the workspace or into
 #                               protected dirs (.pyddock/, workspace modules, script dirs)
@@ -183,23 +188,38 @@ class_allow = [".*"]
 #       "none"                — no path scanning (fully trust the command)
 #
 # Args are space-joined before matching: ["filelog", "//depot/..."] → "filelog //depot/..."
-# All regexes use re.match() (implicitly anchored at start).
+# allow patterns use re.match() (anchored at start); deny patterns use re.search() (anywhere).
 
+# Local git: read queries + workspace writes, but no push / remote-write /
+# config-write. The read-only plumbing verbs below are also what GitPython
+# shells out to internally (iter_commits, remotes, head, ...), so they keep
+# GitPython working under the git.cmd.Git.execute guard.
 [shell.git]
 mode = "deny"
+# Deny-always-wins: command-execution transports/options unsafe in any git
+# subcommand (fetch/pull/ls-remote/...). Blocks the ext:: transport and the
+# upload/receive-pack hooks (local RCE), regardless of the allow-list below.
+deny = ["ext::", "--upload-pack", "--receive-pack"]
 allow = [
     # Read-only queries
-    "status.*", "log.*", "diff.*", "show.*", "branch.*", "rev-parse.*",
+    "status.*", "log.*", "diff.*", "show.*", "rev-parse.*",
     "ls-files.*", "ls-tree.*", "cat-file.*", "blame.*",
     "describe.*", "shortlog.*",
-    # Remote sync (no push)
-    "fetch.*", "pull.*",
-    # Workspace write operations (no push/remote/config)
+    # Read-only plumbing (what GitPython shells out to internally)
+    "rev-list.*", "for-each-ref.*", "show-ref.*",
+    "ls-remote.*", "version.*", "var.*",
+    "remote$", "remote (-v|--verbose)$", "remote show.*", "remote get-url.*",
+    "config --get.*", "config --list.*", "config -l.*",
+    # Local-only writes: mutate this clone's refs / HEAD / index / worktree, but
+    # never the remote (no push). Trashing the local workspace is in scope.
+    "branch.*", "symbolic-ref.*",
     "add.*", "rm.*", "mv.*", "restore.*",
     "checkout.*", "switch.*",
     "commit.*", "merge.*", "rebase.*", "cherry-pick.*",
     "reset.*", "stash.*", "clean.*",
     "tag.*",
+    # Remote sync: download into this clone only (no push)
+    "fetch.*", "pull.*",
 ]
 
 [shell.p4]

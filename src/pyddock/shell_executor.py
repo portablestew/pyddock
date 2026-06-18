@@ -93,6 +93,63 @@ def resolve_command(command: str) -> list[str]:
         return [command]
 
 
+# ---------------------------------------------------------------------------
+# Shared shell-policy argument matching
+# ---------------------------------------------------------------------------
+#
+# These primitives are the single source of truth for how shell-policy patterns
+# are matched. They are used by all three enforcement sites — run_shell
+# (ShellExecutor), subprocess.run inside run_python (_subprocess_patch), and the
+# GitPython guard (_gitpython_patch) — so the paths cannot drift.
+#
+# The match/search asymmetry is deliberate and security-relevant:
+#   - ALLOW patterns authorize an operation by its leading verb (position 0 of
+#     the args string), so they are start-anchored via re.match. Using search
+#     would let an approved word appearing anywhere wrongly pass.
+#   - DENY patterns forbid a token wherever it appears (e.g. "fetch ext::..."),
+#     so they use re.search. (A re.match(".*token") idiom would miss a token
+#     placed after a newline, since "." doesn't match newlines — search does.)
+# Deny always wins: it is checked first, in both modes.
+
+
+def args_match_deny(deny_patterns: list[str], args_str: str) -> str | None:
+    """Return the first deny pattern that matches anywhere in args_str, else None."""
+    for pattern in deny_patterns:
+        if re.search(pattern, args_str):
+            return pattern
+    return None
+
+
+def args_match_allow(allow_patterns: list[str], args_str: str) -> bool:
+    """True if args_str matches (start-anchored) at least one allow pattern."""
+    return any(re.match(pattern, args_str) for pattern in allow_patterns)
+
+
+def evaluate_arg_policy(
+    args_str: str,
+    *,
+    mode: str,
+    allow: list[str],
+    deny: list[str],
+) -> str | None:
+    """Evaluate an args string against allow/deny patterns.
+
+    Returns None if permitted, or a short reason string if rejected. Deny is
+    checked first (and in both modes); for mode="deny" the args must then match
+    an allow pattern. Callers format the reason into a user-facing message.
+    """
+    hit = args_match_deny(deny, args_str)
+    if hit is not None:
+        return f"matched deny pattern '{hit}'"
+
+    if mode == "deny":
+        if not allow:
+            return "no argument patterns are allowed for this command"
+        if not args_match_allow(allow, args_str):
+            return "not permitted by the allow-list"
+    return None
+
+
 @dataclass
 class RunShellOutput:
     """Structured output from a shell command execution."""
@@ -256,36 +313,31 @@ class ShellExecutor:
         """Validate args against the policy's allow/deny patterns.
 
         Returns None if args are permitted, or an error message string if rejected.
+        Delegates the allow/deny decision to the shared evaluate_arg_policy() so
+        run_shell, subprocess.run, and the GitPython guard stay in lockstep.
         """
         args_str = " ".join(args)
-
-        if policy.mode == "deny":
-            # Deny-by-default: args must match at least one allow pattern
-            if not policy.allow:
-                return (
-                    "No argument patterns are allowed for this command.\n"
-                    "Tip: Use run_python for complex workflows."
-                )
-            if not any(re.match(pattern, args_str) for pattern in policy.allow):
-                allowed = ", ".join(policy.allow)
-                return (
-                    f"Arguments '{args_str}' not permitted. "
-                    f"Allowed patterns: {allowed}\n"
-                    f"Tip: Use run_python for complex workflows."
-                )
+        reason = evaluate_arg_policy(
+            args_str, mode=policy.mode, allow=policy.allow, deny=policy.deny
+        )
+        if reason is None:
             return None
-
-        elif policy.mode == "allow":
-            # Allow-by-default: args must NOT match any deny pattern
-            for pattern in policy.deny:
-                if re.match(pattern, args_str):
-                    return (
-                        f"Arguments '{args_str}' matched deny pattern '{pattern}'.\n"
-                        f"Tip: Use run_python for complex workflows."
-                    )
-            return None
-
-        return None
+        if "deny pattern" in reason:
+            return (
+                f"Arguments '{args_str}' {reason}.\n"
+                f"Tip: Use run_python for complex workflows."
+            )
+        if "no argument patterns" in reason:
+            return (
+                "No argument patterns are allowed for this command.\n"
+                "Tip: Use run_python for complex workflows."
+            )
+        allowed = ", ".join(policy.allow)
+        return (
+            f"Arguments '{args_str}' not permitted. "
+            f"Allowed patterns: {allowed}\n"
+            f"Tip: Use run_python for complex workflows."
+        )
 
     def _check_arg_paths(
         self, policy: ShellPolicyConfig, args: list[str]
