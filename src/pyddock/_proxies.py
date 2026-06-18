@@ -17,7 +17,7 @@ import sys
 import types
 from typing import Any
 
-from pyddock._base import _find_deny_hint
+from pyddock._base import _find_deny_hint, _is_module_bound_builtin, _wrap_safe_callable
 from pyddock._import_hook import _caller_is_trusted
 
 # ---------------------------------------------------------------------------
@@ -350,6 +350,12 @@ class _CallerScopedModuleProxy(types.ModuleType):
                 except (PermissionError, ImportError):
                     continue
                 if val is not _MISSING:
+                    # Neutralize module-bound C builtins (e.g. io.open_code,
+                    # sys.getrecursionlimit) before they reach agent code —
+                    # otherwise `attr.__self__` leaks the real module. See
+                    # _wrap_safe_callable / _is_module_bound_builtin in _base.
+                    if _is_module_bound_builtin(val):
+                        val = _wrap_safe_callable(val)
                     object.__setattr__(self, name, val)
 
         # Pre-cache ALL custom_attrs entries (some may not be in always_allowed).
@@ -386,7 +392,10 @@ class _CallerScopedModuleProxy(types.ModuleType):
         # Fallback for always-allowed (shouldn't fire normally due to pre-caching)
         if name in always_allowed:
             if hasattr(real_module, name):
-                return getattr(real_module, name)
+                val = getattr(real_module, name)
+                if _is_module_bound_builtin(val):
+                    val = _wrap_safe_callable(val)
+                return val
             raise AttributeError(
                 f"module '{module_name}' has no attribute '{name}'"
             )

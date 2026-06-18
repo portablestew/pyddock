@@ -78,6 +78,7 @@ def config() -> PyddockConfig:
                 "os",
                 "sys",
                 "threading",
+                "io",
                 "json",
                 "math",
                 "pathlib",
@@ -320,3 +321,135 @@ class TestFunctionalPreservation:
         result = _run(executor, workspace, "x = 10\ny = 20\nx + y")
         assert result.exit_code == 0, result.stderr
         assert result.result == "30"
+
+
+# ---------------------------------------------------------------------------
+# 4. Module-bound builtin (__self__) leak
+# ---------------------------------------------------------------------------
+
+
+class TestModuleBoundBuiltinLeak:
+    """A bound C builtin (os.getcwd, sys.getrecursionlimit, io.open_code) must
+    not hand agent code its defining module via ``func.__self__``.
+
+    The safe os/sys proxies copied real builtins verbatim; `func.__self__` then
+    pointed back at the real `nt`/`sys` module — a one-step escape to unpatched
+    `nt.open`/`nt.write` (file writes anywhere, incl. the protected `.pyddock/`)
+    or, for sys, `sys.modules` -> `pyddock._base._ORIGINALS['builtins.open']`.
+    The fix wraps such builtins in a plain Python function (no `__self__`).
+    """
+
+    # (module, attribute) pairs that previously leaked their real module.
+    LEAKY_BUILTINS = [
+        ("os", "getcwd"),
+        ("os", "urandom"),
+        ("os", "listdir"),
+        ("sys", "getrecursionlimit"),
+        ("sys", "getdefaultencoding"),
+        ("sys", "getfilesystemencoding"),
+        ("io", "open_code"),
+    ]
+
+    @pytest.mark.parametrize("module, attr", LEAKY_BUILTINS)
+    def test_self_does_not_expose_module(self, executor, workspace, module, attr) -> None:
+        # The wrapped callable is an ordinary function — it has no __self__ at
+        # all, so a literal access raises AttributeError and a hasattr is False.
+        src = f"import {module}\nhasattr({module}.{attr}, '__self__')"
+        result = _run(executor, workspace, src)
+        assert result.exit_code == 0, result.stderr
+        assert result.result == "False"
+
+    def test_sys_self_escape_to_sys_modules_is_closed(self, executor, workspace) -> None:
+        # Full historical escape chain: sys.getrecursionlimit.__self__ -> real
+        # sys -> sys.modules -> pyddock internals / real nt module.
+        src = "import sys\nreal = sys.getrecursionlimit.__self__\nreal.modules"
+        result = _run(executor, workspace, src)
+        assert result.exit_code != 0
+        assert "AttributeError" in result.stderr
+
+    def test_write_escape_via_os_self_is_closed(self, executor, workspace) -> None:
+        # The proof-of-exploit path: os.getcwd.__self__ -> real nt -> nt.open.
+        src = (
+            "import os\n"
+            "real = os.getcwd.__self__\n"
+            "fd = real.open('pwned.txt', real.O_WRONLY | real.O_CREAT)\n"
+        )
+        result = _run(executor, workspace, src)
+        assert result.exit_code != 0
+        assert "AttributeError" in result.stderr
+        assert not (workspace / "pwned.txt").exists()
+
+    def test_closure_fallback_is_blocked(self, executor, workspace) -> None:
+        # The wrapped builtin is captured in the wrapper's __closure__; that
+        # attribute is in block_attributes, so the fallback extraction is also
+        # rejected (statically by AST, and dynamically by the getattr guard).
+        src = "import os\ngetattr(os.getcwd, '__closure__')"
+        result = _run(executor, workspace, src)
+        assert result.exit_code != 0
+        assert "PermissionError" in result.stderr
+
+    def test_no_module_bound_builtin_leaks_anywhere(self, executor, workspace) -> None:
+        # Broad sweep: across every allowlisted module, no agent-reachable
+        # callable may expose a module via __self__. This is the catch-all that
+        # guards against a future proxy/refactor reopening the class of bug.
+        src = (
+            "import types as _t\n"
+            "import os, sys, io, json, math, pathlib, types, typing, collections\n"
+            "mods = {'os': os, 'sys': sys, 'io': io, 'json': json, 'math': math,\n"
+            "        'pathlib': pathlib, 'types': types, 'typing': typing,\n"
+            "        'collections': collections}\n"
+            "leaks = []\n"
+            "for _n, _m in mods.items():\n"
+            "    for _a in dir(_m):\n"
+            "        if _a.startswith('__'):\n"
+            "            continue\n"
+            "        try:\n"
+            "            _v = getattr(_m, _a)\n"
+            "        except Exception:\n"
+            "            continue\n"
+            "        if not callable(_v):\n"
+            "            continue\n"
+            "        try:\n"
+            "            _s = getattr(_v, '__self__', None)\n"
+            "        except Exception:\n"
+            "            continue\n"
+            "        if isinstance(_s, _t.ModuleType):\n"
+            "            leaks.append(_n + '.' + _a)\n"
+            "leaks\n"
+        )
+        result = _run(executor, workspace, src)
+        assert result.exit_code == 0, result.stderr
+        assert result.result == "[]", f"module-bound builtin leaks: {result.result}"
+
+
+class TestModuleBoundBuiltinPreserved:
+    """Wrapping the builtins must not break their normal behaviour."""
+
+    def test_os_getcwd_works(self, executor, workspace) -> None:
+        result = _run(executor, workspace, "import os\nisinstance(os.getcwd(), str)")
+        assert result.exit_code == 0, result.stderr
+        assert result.result == "True"
+
+    def test_os_listdir_works(self, executor, workspace) -> None:
+        result = _run(executor, workspace, "import os\nisinstance(os.listdir('.'), list)")
+        assert result.exit_code == 0, result.stderr
+        assert result.result == "True"
+
+    def test_os_urandom_works(self, executor, workspace) -> None:
+        result = _run(executor, workspace, "import os\nlen(os.urandom(8))")
+        assert result.exit_code == 0, result.stderr
+        assert result.result == "8"
+
+    def test_sys_getrecursionlimit_works(self, executor, workspace) -> None:
+        result = _run(
+            executor, workspace, "import sys\nisinstance(sys.getrecursionlimit(), int)"
+        )
+        assert result.exit_code == 0, result.stderr
+        assert result.result == "True"
+
+    def test_wrapped_builtin_keeps_name_and_module(self, executor, workspace) -> None:
+        # Introspection still reports the original identity, not the wrapper's.
+        src = "import os\n(os.getcwd.__name__, os.getcwd.__module__)"
+        result = _run(executor, workspace, src)
+        assert result.exit_code == 0, result.stderr
+        assert result.result == "('getcwd', 'nt')" or result.result == "('getcwd', 'posix')"

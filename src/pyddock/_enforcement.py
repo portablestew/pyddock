@@ -16,7 +16,10 @@ import sys
 import types
 from typing import Any
 
-from pyddock._base import SNIPPET_FILENAME, _ORIGINALS, _find_deny_hint
+from pyddock._base import (
+    SNIPPET_FILENAME, _ORIGINALS, _find_deny_hint,
+    _is_module_bound_builtin, _wrap_safe_callable,
+)
 from pyddock._import_hook import _ImportBlocker, _caller_is_trusted
 from pyddock._proxies import (
     MethodFilterProxy, FactoryProxy, _CallerScopedModuleProxy,
@@ -455,6 +458,21 @@ class RuntimeEnforcement:
         safe_os.__doc__ = "Safe os proxy provided by pyddock."
         safe_os._pyddock_safe = True
 
+        # The low-level os functions (getcwd, listdir, ...) are C builtins
+        # bound to the underlying nt/posix module. Copying them verbatim leaks
+        # that real module via `func.__self__` — a one-step sandbox escape to
+        # the unpatched os.open/os.write/os.remove primitives. Hand agent code a
+        # thin Python wrapper instead (see _wrap_safe_callable in _base). Plain
+        # constants (strings) and classes (PathLike) carry no `__self__` binding
+        # and are copied as-is.
+        def _copy_attr(name: str) -> None:
+            if not hasattr(_real_os, name):
+                return
+            val = getattr(_real_os, name)
+            if _is_module_bound_builtin(val):
+                val = _wrap_safe_callable(val)
+            setattr(safe_os, name, val)
+
         # Safe constants and attributes
         _safe_attrs = [
             "name", "sep", "altsep", "extsep", "pathsep", "linesep",
@@ -462,8 +480,7 @@ class RuntimeEnforcement:
             "cpu_count", "PathLike", "fspath",
         ]
         for attr in _safe_attrs:
-            if hasattr(_real_os, attr):
-                setattr(safe_os, attr, getattr(_real_os, attr))
+            _copy_attr(attr)
 
         # Safe functions (read-only operations)
         _safe_funcs = [
@@ -473,8 +490,7 @@ class RuntimeEnforcement:
             "stat", "lstat", "fstat",
         ]
         for attr in _safe_funcs:
-            if hasattr(_real_os, attr):
-                setattr(safe_os, attr, getattr(_real_os, attr))
+            _copy_attr(attr)
 
         # os.environ — expose as read-only (MappingProxyType)
         MappingProxyType = self._types_module.MappingProxyType
