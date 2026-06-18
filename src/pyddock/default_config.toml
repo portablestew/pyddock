@@ -111,7 +111,22 @@ block_calls = ["eval", "exec", "compile", "breakpoint", "__import__"]
 # namespaces (including enforcement internals and real module references).
 # Blocking tb_frame/gi_frame/cr_frame/ag_frame severs traceback/generator -> frame;
 # blocking f_back/f_globals/f_locals/f_builtins neutralizes any frame still obtained.
-block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "__mro__", "__closure__", "f_globals", "f_locals", "f_back", "f_builtins", "tb_frame", "gi_frame", "cr_frame", "ag_frame"]
+#
+# The object-graph traversal primitives (__subclasses__/__bases__/__base__/__mro__)
+# and the reflective accessors (__getattribute__/__getattr__) are blocked to raise
+# the cost of the classic `type.__dict__['__subclasses__']` walk.
+# NOTE (hardening scope): these names are enforced against attribute SYNTAX, the
+# getattr/attrgetter builtins, and (via ast_validator) constant-keyed subscripts and
+# reflective-call arguments. They are a first-line speed bump against accidental /
+# copy-pasted escapes, NOT a boundary — a variable-keyed __dict__ subscript still
+# reaches them. __class__ and __dict__ are deliberately NOT listed: blocking them
+# would break common, legitimate library and snippet introspection (the global
+# getattr guard would reject getattr(o, '__dict__') deep inside allowed libraries)
+# for little adversarial gain. __reduce__/__reduce_ex__ are likewise NOT listed:
+# CPython's enum machinery does getattr(enum_member, '__reduce_ex__') for every Enum
+# subclass, so blocking them breaks any code (or library) that defines an enum.
+# The durable fix is OS-level write enforcement.
+block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "__base__", "__mro__", "__closure__", "__getattribute__", "__getattr__", "f_globals", "f_locals", "f_back", "f_builtins", "tb_frame", "gi_frame", "cr_frame", "ag_frame"]
 
 # Per-library runtime restrictions.
 # mode = "allow": permit everything except functions matching deny patterns.
@@ -131,8 +146,12 @@ class_allow = ["list_.*", "describe_.*", "get_.*", "head_.*", "scan", "query", "
 
 [restrictions.polars]
 mode = "allow"
-module_deny = ["write_.*", "sink_.*"]
-class_deny = ["write_.*", "sink_.*"]
+# serialize() does file I/O in Rust (bypasses Python open()/pathlib scoping and
+# the .pyddock/ guard) and is not named write_*/sink_*. Blocked by name here.
+# NOTE: this also blocks the in-memory serialize() (returns bytes) used for
+# caching/transport; an argument-aware guard would be needed to allow that.
+module_deny = ["write_.*", "sink_.*", "serialize"]
+class_deny = ["write_.*", "sink_.*", "serialize"]
 
 [restrictions.P4]
 mode = "deny"

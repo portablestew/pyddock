@@ -30,8 +30,15 @@ class ASTValidator:
     messages are generated from config values (not hardcoded).
     """
 
+    # Call targets that perform string-keyed attribute reflection. A blocked
+    # attribute name passed as a constant first argument to one of these is
+    # equivalent to a blocked `.attr` access and is flagged (2a).
+    _REFLECTIVE_ACCESSORS = frozenset({"getattr", "__getattribute__", "__getattr__"})
+
     def __init__(self, config: PyddockConfig) -> None:
         self._config = config
+        # Precomputed set for O(1) membership in the AST walk.
+        self._block_attr_set = frozenset(config.ast.block_attributes)
 
     def validate(self, source: str) -> list[ASTViolation]:
         """Validate Python source against policy config.
@@ -87,11 +94,46 @@ class ASTValidator:
                     # same name on allowed modules.
                     if isinstance(node.func, ast.Name):
                         violations.append(self._call_violation(name, node.lineno))
+                # 2a: reflective accessors — getattr(obj, "__globals__"),
+                # obj.__getattribute__("__globals__"), obj.__getattr__("__bases__").
+                # A blocked attribute name passed as a constant string argument is
+                # equivalent to a blocked `.attr` access. The name is the 1st arg
+                # for the method forms and the 2nd for getattr(); rather than
+                # special-case each signature, flag any constant string argument
+                # that names a blocked attribute. (Variable arguments cannot be
+                # resolved statically; the runtime getattr guard is the backstop.)
+                if name in self._REFLECTIVE_ACCESSORS:
+                    for arg in node.args:
+                        if (
+                            isinstance(arg, ast.Constant)
+                            and isinstance(arg.value, str)
+                            and arg.value in self._block_attr_set
+                        ):
+                            violations.append(
+                                self._reflection_violation(arg.value, node.lineno)
+                            )
 
             elif isinstance(node, ast.Attribute):
                 if node.attr in self._config.ast.block_attributes:
                     violations.append(
                         self._attr_violation(node.attr, node.lineno)
+                    )
+
+            elif isinstance(node, ast.Subscript):
+                # 2a: string-keyed access to a blocked attribute via a mapping,
+                # e.g. type.__dict__["__subclasses__"], vars(obj)["__globals__"],
+                # __builtins__["__globals__"]. The AST attribute check only sees
+                # `.attr` syntax; this closes the subscript form. Only constant
+                # string keys are resolvable statically; the dunder-name set is
+                # narrow enough that legitimate data keys are not affected.
+                key = node.slice
+                if (
+                    isinstance(key, ast.Constant)
+                    and isinstance(key.value, str)
+                    and key.value in self._block_attr_set
+                ):
+                    violations.append(
+                        self._subscript_violation(key.value, node.lineno)
                     )
 
         return violations
@@ -156,6 +198,43 @@ class ASTValidator:
         )
         return ASTViolation(
             kind="blocked_attribute",
+            name=attr_name,
+            line=line,
+            message=message,
+        )
+
+    def _subscript_violation(self, attr_name: str, line: int) -> ASTViolation:
+        """Create a violation for blocked-attribute access via subscripting.
+
+        Catches the `__dict__["__subclasses__"]` / `vars(obj)["__globals__"]`
+        form that the plain `.attr` attribute check does not see.
+        """
+        message = (
+            f"SecurityError: Subscript access to '{attr_name}' is not permitted "
+            f"(e.g. obj.__dict__['{attr_name}'] or vars(obj)['{attr_name}']). "
+            f"Please rewrite your snippet to avoid this attribute."
+        )
+        return ASTViolation(
+            kind="blocked_subscript",
+            name=attr_name,
+            line=line,
+            message=message,
+        )
+
+    def _reflection_violation(self, attr_name: str, line: int) -> ASTViolation:
+        """Create a violation for blocked-attribute access via a reflective call.
+
+        Catches getattr(obj, "__globals__") and
+        obj.__getattribute__("__globals__") with a constant name argument.
+        """
+        message = (
+            f"SecurityError: Reflective access to '{attr_name}' is not permitted "
+            f"(e.g. getattr(obj, '{attr_name}') or "
+            f"obj.__getattribute__('{attr_name}')). "
+            f"Please rewrite your snippet to avoid this attribute."
+        )
+        return ASTViolation(
+            kind="blocked_reflection",
             name=attr_name,
             line=line,
             message=message,
