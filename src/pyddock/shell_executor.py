@@ -14,14 +14,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pyddock.config import PyddockConfig, ShellPolicyConfig, find_deny_hint
+from pyddock._base import canonical_path
 from pyddock._process_utils import get_startupinfo, kill_and_drain, make_child_env, truncate_output
 
 import shutil
 
 
 def _abspath(p: Path) -> Path:
-    """Normalize path without resolving symlinks/subst drives."""
-    return Path(_os.path.abspath(str(p)))
+    """Canonicalize a path for shell-arg containment checks.
+
+    Uses realpath (via canonical_path) so OS-level aliases — Windows 8.3 short
+    names (PYDDOC~1 -> .pyddock), symlinks, junctions, subst drives — are
+    resolved the same way the OS resolves them when the command runs. A purely
+    lexical abspath would leave such aliases intact and let a path-like arg slip
+    a protected directory (e.g. .pyddock/) past the arg_paths scanner.
+    """
+    return canonical_path(p)
 
 
 def _looks_like_path(arg: str) -> bool:

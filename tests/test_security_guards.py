@@ -157,6 +157,87 @@ class TestPyddockDirWriteProtected:
         assert "BLOCKED" in result.stdout
         assert "SHOULD NOT REACH" not in result.stdout
 
+    def test_write_to_workspace_pyddock_dir_blocked(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """Writing to the workspace .pyddock/ directory is blocked (not tmp/)."""
+        config = _make_config()
+        executor = SubprocessExecutor(config, venv_manager)
+
+        # .pyddock/ is inside the workspace (so it passes the writable-paths
+        # boundary) but is structurally protected against self-modification.
+        source = (
+            "import pathlib\n"
+            "try:\n"
+            "    pathlib.Path('.pyddock/pwned.txt').write_text('x')\n"
+            "    print('SHOULD NOT REACH')\n"
+            "except PermissionError as e:\n"
+            "    print(f'BLOCKED: {e}')\n"
+        )
+        result = executor.execute(source, [], 10, workspace)
+
+        assert result.exit_code == 0
+        assert "BLOCKED" in result.stdout
+        assert "SHOULD NOT REACH" not in result.stdout
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="8.3 short-name aliasing is Windows-only"
+    )
+    def test_write_to_pyddock_via_short_name_alias_blocked(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """Regression: a Windows 8.3 short-name alias for .pyddock cannot be used
+        to bypass the write protection.
+
+        os.path.abspath() (lexical) leaves an 8.3 alias like PYDDOC~1 intact, so
+        the relative_to('.pyddock') containment check would wrongly decide the
+        path is outside .pyddock/ — while the OS resolves PYDDOC~1 -> .pyddock at
+        open() time. The fix canonicalizes with realpath (expands short names),
+        closing the gap. Skips if the volume has 8.3 generation disabled.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        pyddock_dir = workspace / ".pyddock"
+        pyddock_dir.mkdir()
+
+        # Ask Windows for the directory's 8.3 short path.
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        _GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        _GetShortPathNameW.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(1024)
+        n = _GetShortPathNameW(str(pyddock_dir), buf, 1024)
+        if n == 0:
+            pytest.skip("GetShortPathNameW failed")
+        short_full = buf.value
+        short_name = os.path.basename(short_full)
+
+        # If no distinct short name was generated (8.3 disabled on this volume),
+        # there is nothing to test.
+        if short_name.lower() == ".pyddock":
+            pytest.skip("8.3 short-name generation disabled on this volume")
+
+        config = _make_config()
+        executor = SubprocessExecutor(config, venv_manager)
+
+        # Write through the short-name alias, relative to the workspace cwd.
+        source = (
+            "import pathlib\n"
+            f"alias = {short_name + '/pwned.txt'!r}\n"
+            "try:\n"
+            "    pathlib.Path(alias).write_text('x')\n"
+            "    print('SHOULD NOT REACH')\n"
+            "except PermissionError as e:\n"
+            "    print(f'BLOCKED: {e}')\n"
+        )
+        result = executor.execute(source, [], 10, workspace)
+
+        assert result.exit_code == 0
+        assert "BLOCKED" in result.stdout, result.stdout
+        assert "SHOULD NOT REACH" not in result.stdout
+        # And the file must not have been created in the real .pyddock/.
+        assert not (pyddock_dir / "pwned.txt").exists()
+
 
 class TestImportBypassSecurity:
     """Verify the import bypass cannot be exploited by agent code."""

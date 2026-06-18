@@ -12,7 +12,7 @@ import re
 import sys
 from typing import Any
 
-from pyddock._base import _ORIGINALS, _find_deny_hint
+from pyddock._base import _ORIGINALS, _find_deny_hint, canonical_path
 from pyddock.shell_executor import evaluate_arg_policy, evaluate_arg_paths
 
 
@@ -94,12 +94,15 @@ def apply_subprocess_patch(
             f"Arguments '{args_str}' not permitted. Allowed patterns: {allowed}"
         )
 
-    # Pre-compute protected paths for arg scanning
+    # Pre-compute protected paths for arg scanning.
+    # canonical_path (realpath) resolves 8.3 short names / symlinks / junctions /
+    # subst drives so cwd containment checks cannot be bypassed by aliasing — the
+    # same hardening applied in _fs_enforcement and shell_executor.
     _ws_root = workspace_root
-    _pyddock_dir = pathlib.Path(_real_os.path.abspath(str(_ws_root / ".pyddock")))
+    _pyddock_dir = canonical_path(_ws_root / ".pyddock")
     _workspace_imports = config.get("imports", {}).get("workspace", {})
     _ws_module_dirs: list[tuple[str, pathlib.Path]] = [
-        (mod_name, pathlib.Path(_real_os.path.abspath(str(_ws_root / rel_path))))
+        (mod_name, canonical_path(_ws_root / rel_path))
         for mod_name, rel_path in _workspace_imports.items()
     ]
     _shell_protected_dirs: list[tuple[str, pathlib.Path]] = []
@@ -116,9 +119,9 @@ def apply_subprocess_patch(
             if _sp_dir:
                 _sp_clean = _sp_dir.replace("\\.", ".").replace("\\/", "/")
                 _shell_protected_dirs.append(
-                    (_sp_clean, pathlib.Path(_real_os.path.abspath(str(_ws_root / _sp_clean))))
+                    (_sp_clean, canonical_path(_ws_root / _sp_clean))
                 )
-    _ws_root_abs = pathlib.Path(_real_os.path.abspath(str(_ws_root)))
+    _ws_root_abs = canonical_path(_ws_root)
 
     _looks_like_path_rt = looks_like_path
     _extract_path_candidates_rt = extract_path_candidates
@@ -156,7 +159,7 @@ def apply_subprocess_patch(
         if arg_paths_mode == "none":
             return None
 
-        resolved = pathlib.Path(_real_os.path.abspath(str(cwd)))
+        resolved = canonical_path(cwd)
 
         # Check .pyddock/ (excluding .pyddock/tmp/)
         try:

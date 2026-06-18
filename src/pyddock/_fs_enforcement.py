@@ -14,7 +14,7 @@ import tempfile as _tempfile_module
 import _io as _cio_module
 from typing import Any
 
-from pyddock._base import _ORIGINALS, _PYDDOCK_DIR, _find_deny_hint
+from pyddock._base import _ORIGINALS, _PYDDOCK_DIR, _find_deny_hint, canonical_path
 from pyddock._import_hook import _caller_is_trusted
 
 
@@ -38,10 +38,20 @@ def apply_filesystem_scoping(
     _real_os = real_os
 
     def _abspath(p: pathlib.Path) -> pathlib.Path:
-        """Normalize path without resolving symlinks/subst drives."""
-        return pathlib.Path(_real_os.path.abspath(str(p)))
+        """Canonicalize a path for containment checks.
 
-    # Resolve allowed paths to absolute (preserving symlinks)
+        Uses realpath (via canonical_path) so that OS-level path aliases —
+        Windows 8.3 short names (PYDDOC~1 -> .pyddock), symlinks, junctions,
+        and subst drives — are resolved the same way the OS resolves them at
+        open() time. abspath alone is purely lexical and would leave such
+        aliases intact, allowing the protected-directory checks below to be
+        bypassed (see canonical_path docstring). Applied consistently to BOTH
+        the protected roots and every candidate path.
+        """
+        return canonical_path(p)
+
+    # Canonicalize allowed paths (realpath: resolves symlinks/junctions/8.3
+    # names) so they compare consistently with canonicalized candidate paths.
     resolved_writable = [
         _abspath(workspace_root / p) for p in writable_paths
     ]
@@ -54,6 +64,11 @@ def apply_filesystem_scoping(
 
     # .pyddock/ is always excluded from writes (self-modification protection)
     pyddock_dir = _abspath(workspace_root / ".pyddock")
+
+    # pyddock's own source directory (enforcement code), canonicalized the same
+    # way as candidate paths so the relative_to() check below cannot be bypassed
+    # via 8.3 short names / symlinks on the install path.
+    pyddock_src_dir = canonical_path(_PYDDOCK_DIR)
 
     # Resolve workspace module directories (write-protected)
     workspace_imports = config.get("imports", {}).get("workspace", {})
@@ -235,7 +250,7 @@ def apply_filesystem_scoping(
             )
         # Protect pyddock's own source directory (enforcement code)
         try:
-            resolved.relative_to(pathlib.Path(_PYDDOCK_DIR))
+            resolved.relative_to(pyddock_src_dir)
             raise PermissionError(
                 f"PermissionError: Cannot write to '{path}' — the pyddock "
                 f"source directory is protected."

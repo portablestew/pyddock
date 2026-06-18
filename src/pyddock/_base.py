@@ -6,6 +6,7 @@ other pyddock modules. All other _runtime split modules import from here.
 
 from __future__ import annotations
 
+import pathlib
 import re
 import sys
 import types
@@ -23,6 +24,7 @@ _PYDDOCK_DIR = _os_for_path.path.dirname(_os_for_path.path.abspath(__file__))
 # Cache path helpers for _caller_is_trusted (avoids repeated attribute lookups).
 _normcase = _os_for_path.path.normcase
 _realpath = _os_for_path.path.realpath
+_abspath = _os_for_path.path.abspath
 del _os_for_path
 
 # Module-level dict for storing original (unpatched) function references.
@@ -31,6 +33,44 @@ del _os_for_path
 # function.__closure__[N].cell_contents or descriptor-protocol introspection.
 # Since pyddock._* modules are not importable by agent code, this dict is inaccessible.
 _ORIGINALS: dict[str, Any] = {}
+
+
+def canonical_path(path: Any) -> pathlib.Path:
+    """Canonicalize a filesystem path for security containment checks.
+
+    Resolves the path with os.path.realpath, which (on Windows) expands NTFS
+    8.3 short names — e.g. ``PYDDOC~1`` -> ``.pyddock`` — AND resolves symlinks,
+    directory junctions, and subst drives. It falls back to abspath only if
+    realpath raises.
+
+    WHY THIS EXISTS (security-critical):
+        Protected-directory checks compare ``candidate.relative_to(protected)``
+        using a *lexically* normalized path. os.path.abspath() only canonicalizes
+        ``.``/``..`` and is purely textual: it leaves OS-level aliases (8.3 short
+        names, symlinks, junctions) intact. The OS, however, DOES resolve those
+        aliases when the file is actually opened. That gap let agent code defeat
+        the ``.pyddock/`` write protection by writing to ``PYDDOC~1/pwned.txt``:
+        ``abspath`` kept ``PYDDOC~1`` so ``relative_to('.pyddock')`` raised
+        ValueError (the check decided "not in .pyddock"), but ``open()`` resolved
+        ``PYDDOC~1`` -> ``.pyddock`` and the write landed in the protected dir.
+
+        realpath closes the gap by resolving the alias the same way the OS will.
+
+    CONSISTENCY REQUIREMENT:
+        realpath rewrites the path (drive-letter case, short-name expansion,
+        symlink targets). Callers MUST canonicalize BOTH the protected roots and
+        the candidate path with this function so a symlinked / subst-drive
+        workspace still compares equal.
+
+    The result is NOT guaranteed to exist; realpath resolves the existing prefix
+    and appends any trailing non-existent components verbatim, so it is safe to
+    use for write targets that have not been created yet.
+    """
+    s = str(path)
+    try:
+        return pathlib.Path(_realpath(s))
+    except (OSError, ValueError):
+        return pathlib.Path(_abspath(s))
 
 
 def _find_deny_hint(attempted: str, deny_messages: list[tuple[re.Pattern[str], str]]) -> str | None:
