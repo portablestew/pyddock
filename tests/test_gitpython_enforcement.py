@@ -60,6 +60,10 @@ ALLOWED_COMMANDS = [
     # Local write operations are intentionally permitted (no push/remote).
     pytest.param(["git", "add", "."], id="add"),
     pytest.param(["git", "commit", "-m", "msg"], id="commit"),
+    pytest.param(["git", "commit", "-m", "subject\n\nbody line\nmore"], id="commit_multiline"),
+    pytest.param(["git", "checkout", "-b", "feature"], id="checkout_branch"),
+    pytest.param(["git", "merge", "origin/main"], id="merge"),
+    pytest.param(["git", "fetch", "origin"], id="fetch"),
     # Benign global options are tolerated.
     pytest.param(["git", "-C", "subdir", "status"], id="dash_C_value"),
     pytest.param(["git", "--git-dir=.git", "status"], id="git_dir_eq"),
@@ -91,6 +95,15 @@ DENIED_COMMANDS = [
     # Malformed.
     pytest.param(["git"], id="no_subcommand"),
     pytest.param([], id="empty"),
+    # Verb-anchoring: a short allowed verb must NOT prefix-match a longer,
+    # unlisted hyphenated subcommand (the checkout-index escape and friends).
+    pytest.param(
+        ["git", "checkout-index", "--prefix=.pyddock/", "-f", "--", "x"],
+        id="checkout_index",
+    ),
+    pytest.param(["git", "merge-file", "a", "b", "c"], id="merge_file"),
+    pytest.param(["git", "fetch-pack", "--all", "origin"], id="fetch_pack"),
+    pytest.param(["git", "commit-tree", "HEAD^{tree}"], id="commit_tree"),
 ]
 
 
@@ -160,6 +173,74 @@ class TestPatchApplication:
             Git.execute = original
 
 
+class TestArgPathScanning:
+    """The arg_paths scan (parity with run_shell / subprocess.run) blocks path
+    arguments that target protected dirs or, in "workspace" mode, resolve
+    outside the workspace — enforced at the policy's configured level."""
+
+    @pytest.fixture
+    def validate_paths(self, git_allow, tmp_path):
+        config = {
+            "imports": {"allowed": ["git"], "workspace": {}},
+            "shell": {
+                "git": {
+                    "mode": "deny",
+                    "allow": git_allow,
+                    "arg_paths": "workspace",
+                }
+            },
+        }
+        return build_git_command_validator(config, str(tmp_path), deny_messages=[])
+
+    def test_blocks_add_into_pyddock(self, validate_paths) -> None:
+        # The escape's spirit: a permitted subcommand carrying a .pyddock/ path.
+        with pytest.raises(PermissionError, match=r"\.pyddock/"):
+            validate_paths(["git", "add", ".pyddock/pwned.txt"])
+
+    def test_blocks_checkout_pathspec_into_pyddock(self, validate_paths) -> None:
+        with pytest.raises(PermissionError, match=r"\.pyddock/"):
+            validate_paths(["git", "checkout", "--", ".pyddock/pwned.txt"])
+
+    def test_blocks_path_outside_workspace(self, validate_paths) -> None:
+        with pytest.raises(PermissionError, match="outside"):
+            validate_paths(["git", "add", "../../etc/passwd"])
+
+    def test_allows_workspace_relative_path(self, validate_paths) -> None:
+        validate_paths(["git", "add", "output/result.txt"])  # must not raise
+
+    def test_allows_pyddock_tmp(self, validate_paths) -> None:
+        validate_paths(["git", "add", ".pyddock/tmp/scratch.txt"])  # must not raise
+
+    def test_allows_dot(self, validate_paths) -> None:
+        validate_paths(["git", "add", "."])  # must not raise
+
+    def test_respects_protected_mode_allows_outside(self, git_allow, tmp_path) -> None:
+        # "protected" mode permits paths outside the workspace but still blocks
+        # protected dirs.
+        config = {
+            "imports": {"allowed": ["git"], "workspace": {}},
+            "shell": {
+                "git": {"mode": "deny", "allow": git_allow, "arg_paths": "protected"}
+            },
+        }
+        v = build_git_command_validator(config, str(tmp_path), deny_messages=[])
+        v(["git", "add", "C:/somewhere/else/file.txt"])  # outside, but allowed
+        with pytest.raises(PermissionError, match=r"\.pyddock/"):
+            v(["git", "add", ".pyddock/pwned.txt"])
+
+    def test_scan_skipped_without_workspace_root(self, git_allow) -> None:
+        # No workspace_root -> path scan disabled (back-compat for unit tests
+        # that only exercise command/allow validation).
+        v = build_git_command_validator(
+            {
+                "imports": {"allowed": ["git"]},
+                "shell": {"git": {"mode": "deny", "allow": git_allow}},
+            },
+            deny_messages=[],
+        )
+        v(["git", "add", ".pyddock/whatever.txt"])  # no raise (scan skipped)
+
+
 class TestLibraryGuardRegistry:
     def test_gitpython_is_registered(self) -> None:
         from pyddock._library_guards import LIBRARY_GUARDS
@@ -188,7 +269,7 @@ class TestLibraryGuardRegistry:
         # skipped (which would leave its library unguarded).
         import pyddock._library_guards as lg
 
-        def _boom(config, deny_messages):
+        def _boom(config, workspace_root, deny_messages):
             raise RuntimeError("guard exploded")
 
         boom_guard = lg.LibraryGuard(name="boom", import_name="json", apply_fn=_boom)

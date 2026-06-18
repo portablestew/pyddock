@@ -150,6 +150,136 @@ def evaluate_arg_policy(
     return None
 
 
+def derive_protected_dir(cmd_regex: str) -> str | None:
+    """Extract the clean directory portion from a path-like shell command regex.
+
+    A command regex is "path-like" if it contains '/' or '\\\\', or starts with
+    '\\.'. For those, the directory portion (everything before the final path
+    component) is extracted and regex escapes are cleaned up into a usable
+    filesystem path. Returns None for non-path-like regexes (e.g. '^git$').
+
+    This is the single source of truth for deriving write-protected script
+    directories from shell command patterns — used by both the write-protection
+    derivation (_derive_write_protected_paths) and the arg-path scanner
+    (evaluate_arg_paths) so the two cannot drift.
+    """
+    if not ("/" in cmd_regex or "\\\\" in cmd_regex or cmd_regex.startswith("\\.")):
+        return None
+    path_pattern = cmd_regex.lstrip("^").rstrip("$")
+    if "/" in path_pattern:
+        dir_part = path_pattern.rsplit("/", 1)[0]
+    elif "\\\\" in path_pattern:
+        dir_part = path_pattern.rsplit("\\\\", 1)[0]
+    else:
+        dir_part = path_pattern
+    if not dir_part:
+        return None
+    # Clean up regex escapes to get a usable filesystem path
+    return dir_part.replace("\\.", ".").replace("\\/", "/")
+
+
+def evaluate_arg_paths(
+    args: list[str],
+    *,
+    arg_paths: str,
+    workspace_root: Path,
+    workspace_module_dirs: dict[str, str],
+    shell_command_patterns: list[str],
+) -> str | None:
+    """Scan command args for path-like values and validate against arg_paths.
+
+    This is the single source of truth for path-argument scanning, shared by all
+    three enforcement sites: run_shell (ShellExecutor), subprocess.run inside
+    run_python (_subprocess_patch), and the GitPython guard (_gitpython_patch).
+    Keeping it here guarantees the three paths cannot drift.
+
+    Args:
+        args: The command arguments (excluding the command/subcommand-launching
+            token itself; callers pass whatever set should be path-scanned).
+        arg_paths: "none" (skip), "protected" (block protected dirs only), or
+            "workspace" (also block anything resolving outside the workspace).
+        workspace_root: The workspace root; relative args resolve against it.
+        workspace_module_dirs: Map of module name -> relative path for editable
+            workspace packages (write-protected).
+        shell_command_patterns: Every shell policy's command regex. Path-like
+            ones yield write-protected script directories (write-then-execute
+            prevention).
+
+    Returns:
+        None if all args pass, else a user-facing rejection message.
+    """
+    if arg_paths == "none":
+        return None
+
+    ws_root_abs = _abspath(workspace_root)
+    pyddock_dir = _abspath(workspace_root / ".pyddock")
+    script_dirs = [
+        d for d in (derive_protected_dir(p) for p in shell_command_patterns)
+        if d is not None
+    ]
+
+    for arg in args:
+        # Extract all path candidates from this arg (raw + embedded --flag=value)
+        candidates = _extract_path_candidates(arg)
+        if not candidates:
+            continue
+
+        for candidate in candidates:
+            # Resolve relative to workspace root (same as command cwd)
+            resolved = _abspath(workspace_root / candidate)
+
+            # 1. .pyddock/ (excluding .pyddock/tmp/)
+            try:
+                rel = resolved.relative_to(pyddock_dir)
+                if not str(rel).startswith("tmp"):
+                    return (
+                        f"Argument '{arg}' targets the protected .pyddock/ directory. "
+                        f"Shell commands cannot write to .pyddock/ "
+                        f"(self-modification protection)."
+                    )
+            except ValueError:
+                pass
+
+            # 2. Workspace module directories
+            for mod_name, rel_path in workspace_module_dirs.items():
+                ws_mod_dir = _abspath(workspace_root / rel_path)
+                try:
+                    resolved.relative_to(ws_mod_dir)
+                    return (
+                        f"Argument '{arg}' targets workspace module directory "
+                        f"'{mod_name}' ({rel_path}). Shell commands cannot write "
+                        f"to workspace module directories."
+                    )
+                except ValueError:
+                    continue
+
+            # 3. Shell-executable script directories
+            for clean_dir in script_dirs:
+                script_dir = _abspath(workspace_root / clean_dir)
+                try:
+                    resolved.relative_to(script_dir)
+                    return (
+                        f"Argument '{arg}' targets a shell-executable script "
+                        f"directory ({clean_dir}). Shell commands cannot write "
+                        f"to script directories (write-then-execute prevention)."
+                    )
+                except ValueError:
+                    continue
+
+            # 4. "workspace" mode: block paths resolving outside the workspace
+            if arg_paths == "workspace":
+                try:
+                    resolved.relative_to(ws_root_abs)
+                except ValueError:
+                    return (
+                        f"Argument '{arg}' resolves to '{resolved}' which is outside "
+                        f"the workspace. Shell commands are restricted to workspace-"
+                        f"relative paths (arg_paths = \"workspace\")."
+                    )
+
+    return None
+
+
 @dataclass
 class RunShellOutput:
     """Structured output from a shell command execution."""
@@ -344,6 +474,10 @@ class ShellExecutor:
     ) -> str | None:
         """Scan args for path-like values and validate against arg_paths policy.
 
+        Thin wrapper over the shared evaluate_arg_paths() so run_shell stays in
+        lockstep with subprocess.run (_subprocess_patch) and the GitPython guard
+        (_gitpython_patch).
+
         Modes:
           "workspace" — block any path-like arg that resolves outside the workspace
                         or into a protected directory (.pyddock/, workspace modules,
@@ -351,88 +485,17 @@ class ShellExecutor:
           "protected" — only block paths resolving into protected directories.
           "none"      — no path scanning.
 
-        Also extracts embedded paths from --flag=value style arguments to prevent
-        bypasses where a command flag embeds a target path (e.g. --output=.pyddock/file).
-
         Returns None if all args pass, or an error message string if blocked.
         """
-        if policy.arg_paths == "none":
-            return None
-
-        for arg in args:
-            # Extract all path candidates from this arg (raw + embedded values)
-            candidates = _extract_path_candidates(arg)
-            if not candidates:
-                continue
-
-            for candidate in candidates:
-                # Resolve relative to workspace root (same as command cwd)
-                resolved = _abspath(self._workspace_root / candidate)
-
-                # Check protected directories (both "workspace" and "protected" modes)
-                # 1. .pyddock/ (excluding .pyddock/tmp/)
-                pyddock_dir = _abspath(self._workspace_root / ".pyddock")
-                try:
-                    rel = resolved.relative_to(pyddock_dir)
-                    if not str(rel).startswith("tmp"):
-                        return (
-                            f"Argument '{arg}' targets the protected .pyddock/ directory. "
-                            f"Shell commands cannot write to .pyddock/ "
-                            f"(self-modification protection)."
-                        )
-                except ValueError:
-                    pass
-
-                # 2. Workspace module directories
-                workspace_imports = self._config.imports.workspace
-                for mod_name, rel_path in workspace_imports.items():
-                    ws_mod_dir = _abspath(self._workspace_root / rel_path)
-                    try:
-                        resolved.relative_to(ws_mod_dir)
-                        return (
-                            f"Argument '{arg}' targets workspace module directory "
-                            f"'{mod_name}' ({rel_path}). Shell commands cannot write "
-                            f"to workspace module directories."
-                        )
-                    except ValueError:
-                        continue
-
-                # 3. Shell script directories (derived from path-like command regexes)
-                for _name, other_policy in self._config.shell.items():
-                    cmd_regex = other_policy.command
-                    if "/" in cmd_regex or "\\\\" in cmd_regex or cmd_regex.startswith("\\."):
-                        path_pattern = cmd_regex.lstrip("^").rstrip("$")
-                        if "/" in path_pattern:
-                            dir_part = path_pattern.rsplit("/", 1)[0]
-                        elif "\\\\" in path_pattern:
-                            dir_part = path_pattern.rsplit("\\\\", 1)[0]
-                        else:
-                            dir_part = path_pattern
-                        if dir_part:
-                            clean_dir = dir_part.replace("\\.", ".").replace("\\/", "/")
-                            script_dir = _abspath(self._workspace_root / clean_dir)
-                            try:
-                                resolved.relative_to(script_dir)
-                                return (
-                                    f"Argument '{arg}' targets a shell-executable script "
-                                    f"directory ({clean_dir}). Shell commands cannot write "
-                                    f"to script directories (write-then-execute prevention)."
-                                )
-                            except ValueError:
-                                continue
-
-                # 4. "workspace" mode: block paths outside the workspace entirely
-                if policy.arg_paths == "workspace":
-                    try:
-                        resolved.relative_to(_abspath(self._workspace_root))
-                    except ValueError:
-                        return (
-                            f"Argument '{arg}' resolves to '{resolved}' which is outside "
-                            f"the workspace. Shell commands are restricted to workspace-"
-                            f"relative paths (arg_paths = \"workspace\")."
-                        )
-
-        return None
+        return evaluate_arg_paths(
+            args,
+            arg_paths=policy.arg_paths,
+            workspace_root=self._workspace_root,
+            workspace_module_dirs=self._config.imports.workspace,
+            shell_command_patterns=[
+                p.command for p in self._config.shell.values()
+            ],
+        )
 
     def _resolve_command(self, command: str) -> list[str]:
         """Resolve interpreter prefix based on file extension.
@@ -461,20 +524,7 @@ def _derive_write_protected_paths(
     """
     protected: list[str] = []
     for _name, policy in shell_config.items():
-        cmd_regex = policy.command
-        # Heuristic: regex is path-like if it contains path separators or starts with \.
-        if "/" in cmd_regex or "\\\\" in cmd_regex or cmd_regex.startswith("\\."):
-            # Strip regex anchors and convert to a directory pattern
-            path_pattern = cmd_regex.lstrip("^").rstrip("$")
-            # Extract the directory portion
-            if "/" in path_pattern:
-                dir_part = path_pattern.rsplit("/", 1)[0]
-            elif "\\\\" in path_pattern:
-                dir_part = path_pattern.rsplit("\\\\", 1)[0]
-            else:
-                dir_part = path_pattern
-            if dir_part:
-                # Clean up regex escapes to get a usable filesystem path
-                clean_dir = dir_part.replace("\\.", ".").replace("\\/", "/")
-                protected.append(clean_dir)
+        clean_dir = derive_protected_dir(policy.command)
+        if clean_dir is not None:
+            protected.append(clean_dir)
     return protected

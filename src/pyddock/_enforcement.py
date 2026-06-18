@@ -102,6 +102,7 @@ class RuntimeEnforcement:
         # hooks git.cmd.Git.execute and validates against [shell.git] instead.
         apply_library_guards(
             config=self._config,
+            workspace_root=str(self._workspace_root),
             deny_messages=self._deny_messages,
         )
         apply_subprocess_patch(

@@ -13,7 +13,7 @@ import sys
 from typing import Any
 
 from pyddock._base import _ORIGINALS, _find_deny_hint
-from pyddock.shell_executor import evaluate_arg_policy
+from pyddock.shell_executor import evaluate_arg_policy, evaluate_arg_paths
 
 
 def apply_subprocess_patch(
@@ -124,70 +124,20 @@ def apply_subprocess_patch(
     _extract_path_candidates_rt = extract_path_candidates
 
     def _check_arg_paths(policy: dict, cmd_args: list[str]) -> str | None:
-        """Scan args for path-like values and validate against arg_paths policy."""
-        arg_paths_mode = policy.get("arg_paths", "workspace")
-        if arg_paths_mode == "none":
-            return None
+        """Scan args for path-like values and validate against arg_paths policy.
 
-        for arg in cmd_args:
-            # Extract all path candidates (raw arg + embedded --flag=value)
-            candidates = _extract_path_candidates_rt(arg)
-            if not candidates:
-                continue
-
-            for candidate in candidates:
-                resolved = pathlib.Path(_real_os.path.abspath(
-                    str(_ws_root / candidate)
-                ))
-
-                # Check .pyddock/ (excluding .pyddock/tmp/)
-                try:
-                    rel = resolved.relative_to(_pyddock_dir)
-                    if not str(rel).startswith("tmp"):
-                        return (
-                            f"Argument '{arg}' targets the protected .pyddock/ "
-                            f"directory. Shell commands cannot write to .pyddock/ "
-                            f"(self-modification protection)."
-                        )
-                except ValueError:
-                    pass
-
-                # Check workspace module directories
-                for mod_name, ws_dir in _ws_module_dirs:
-                    try:
-                        resolved.relative_to(ws_dir)
-                        return (
-                            f"Argument '{arg}' targets workspace module directory "
-                            f"'{mod_name}'. Shell commands cannot write to workspace "
-                            f"module directories."
-                        )
-                    except ValueError:
-                        continue
-
-                # Check shell script directories
-                for dir_label, script_dir in _shell_protected_dirs:
-                    try:
-                        resolved.relative_to(script_dir)
-                        return (
-                            f"Argument '{arg}' targets a shell-executable script "
-                            f"directory ({dir_label}). Shell commands cannot write "
-                            f"to script directories (write-then-execute prevention)."
-                        )
-                    except ValueError:
-                        continue
-
-                # "workspace" mode: block paths outside the workspace
-                if arg_paths_mode == "workspace":
-                    try:
-                        resolved.relative_to(_ws_root_abs)
-                    except ValueError:
-                        return (
-                            f"Argument '{arg}' resolves outside the workspace. "
-                            f"Shell commands are restricted to workspace-relative "
-                            f"paths (arg_paths = \"workspace\")."
-                        )
-
-        return None
+        Thin wrapper over the shared evaluate_arg_paths() so subprocess.run stays
+        in lockstep with run_shell (ShellExecutor) and the GitPython guard.
+        """
+        return evaluate_arg_paths(
+            cmd_args,
+            arg_paths=policy.get("arg_paths", "workspace"),
+            workspace_root=_ws_root,
+            workspace_module_dirs=_workspace_imports,
+            shell_command_patterns=[
+                p.get("command", "") for p in shell_policies.values()
+            ],
+        )
 
     def _check_cwd(policy: dict, cwd: Any) -> str | None:
         """Validate cwd kwarg against the same rules as arg paths.

@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from pyddock._gitpython_patch import apply_gitpython_patch
 
-# Signature of a guard's apply function: (config_dict, deny_messages) -> installed?
-ApplyFn = Callable[[dict, "list[tuple[re.Pattern[str], str]]"], bool]
+# Signature of a guard's apply function:
+# (config_dict, workspace_root, deny_messages) -> installed?
+ApplyFn = Callable[[dict, "str | Path | None", "list[tuple[re.Pattern[str], str]]"], bool]
 
 
 @dataclass(frozen=True)
@@ -59,9 +61,12 @@ class LibraryGuard:
         return self.import_name in allowed
 
     def apply(
-        self, config: dict, deny_messages: "list[tuple[re.Pattern[str], str]]"
+        self,
+        config: dict,
+        workspace_root: "str | Path | None" = None,
+        deny_messages: "list[tuple[re.Pattern[str], str]] | None" = None,
     ) -> bool:
-        return self.apply_fn(config, deny_messages)
+        return self.apply_fn(config, workspace_root, deny_messages)
 
 
 # The registry. Keep this short and well-justified (see module docstring).
@@ -76,6 +81,7 @@ LIBRARY_GUARDS: list[LibraryGuard] = [
 
 def apply_library_guards(
     config: dict,
+    workspace_root: "str | Path | None" = None,
     deny_messages: "list[tuple[re.Pattern[str], str]] | None" = None,
 ) -> list[str]:
     """Apply every registered guard whose gating import is allowlisted.
@@ -94,6 +100,6 @@ def apply_library_guards(
     for guard in LIBRARY_GUARDS:
         if not guard.applies(config):
             continue
-        if guard.apply(config, deny_messages):
+        if guard.apply(config, workspace_root, deny_messages):
             installed.append(guard.name)
     return installed

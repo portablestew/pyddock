@@ -202,62 +202,69 @@ mode = "deny"
 deny = ["ext::", "--upload-pack", "--receive-pack"]
 allow = [
     # Read-only queries
-    "status.*", "log.*", "diff.*", "show.*", "rev-parse.*",
-    "ls-files.*", "ls-tree.*", "cat-file.*", "blame.*",
-    "describe.*", "shortlog.*",
+    "status(\\s|$)", "log(\\s|$)", "diff(\\s|$)", "show(\\s|$)", "rev-parse(\\s|$)",
+    "ls-files(\\s|$)", "ls-tree(\\s|$)", "cat-file(\\s|$)", "blame(\\s|$)",
+    "describe(\\s|$)", "shortlog(\\s|$)",
     # Read-only plumbing (what GitPython shells out to internally)
-    "rev-list.*", "for-each-ref.*", "show-ref.*",
-    "ls-remote.*", "version.*", "var.*",
-    "remote$", "remote (-v|--verbose)$", "remote show.*", "remote get-url.*",
-    "config --get.*", "config --list.*", "config -l.*",
+    "rev-list(\\s|$)", "for-each-ref(\\s|$)", "show-ref(\\s|$)",
+    "ls-remote(\\s|$)", "version(\\s|$)", "var(\\s|$)",
+    "remote$", "remote (-v|--verbose)$", "remote show(\\s|$)", "remote get-url(\\s|$)",
+    "config --get(\\s|$)", "config --get-all(\\s|$)", "config --get-regexp(\\s|$)",
+    "config --list(\\s|$)", "config -l(\\s|$)",
     # Local-only writes: mutate this clone's refs / HEAD / index / worktree, but
     # never the remote (no push). Trashing the local workspace is in scope.
-    "branch.*", "symbolic-ref.*",
-    "add.*", "rm.*", "mv.*", "restore.*",
-    "checkout.*", "switch.*",
-    "commit.*", "merge.*", "rebase.*", "cherry-pick.*",
-    "reset.*", "stash.*", "clean.*",
-    "tag.*",
+    "branch(\\s|$)", "symbolic-ref(\\s|$)",
+    "add(\\s|$)", "rm(\\s|$)", "mv(\\s|$)", "restore(\\s|$)",
+    "checkout(\\s|$)", "switch(\\s|$)",
+    "commit(\\s|$)", "merge(\\s|$)", "rebase(\\s|$)", "cherry-pick(\\s|$)",
+    "reset(\\s|$)", "stash(\\s|$)", "clean(\\s|$)",
+    "tag(\\s|$)",
     # Remote sync: download into this clone only (no push)
-    "fetch.*", "pull.*",
+    "fetch(\\s|$)", "pull(\\s|$)",
 ]
 
 [shell.p4]
 mode = "deny"
+# Verbs anchored with (\s|$) for the same reason as [shell.git]: a short verb
+# must not prefix-match a longer one (e.g. "change" must not swallow "changes",
+# "info" must not match "information"). Not end-anchored (see [shell.git]).
 allow = [
     # Read-only queries
-    "filelog.*", "files.*", "describe.*", "changes.*", "print.*", "where.*", "info",
-    "fstat.*", "have.*", "dirs.*", "depots.*", "clients.*", "users.*",
-    "opened.*", "diff.*", "diff2.*", "annotate.*",
-    "streams.*", "client -o.*", "stream -o.*",
+    "filelog(\\s|$)", "files(\\s|$)", "describe(\\s|$)", "changes(\\s|$)",
+    "print(\\s|$)", "where(\\s|$)", "info(\\s|$)",
+    "fstat(\\s|$)", "have(\\s|$)", "dirs(\\s|$)", "depots(\\s|$)",
+    "clients(\\s|$)", "users(\\s|$)",
+    "opened(\\s|$)", "diff(\\s|$)", "diff2(\\s|$)", "annotate(\\s|$)",
+    "streams(\\s|$)", "client -o(\\s|$)", "stream -o(\\s|$)",
     # Workspace write operations (no submit)
-    "edit.*", "add.*", "delete.*", "revert.*",
-    "sync.*", "reconcile.*", "resolve.*",
-    "shelve.*", "unshelve.*",
-    "integrate.*", "move.*", "reopen.*",
+    "edit(\\s|$)", "add(\\s|$)", "delete(\\s|$)", "revert(\\s|$)",
+    "sync(\\s|$)", "reconcile(\\s|$)", "resolve(\\s|$)",
+    "shelve(\\s|$)", "unshelve(\\s|$)",
+    "integrate(\\s|$)", "move(\\s|$)", "reopen(\\s|$)",
     # Changelist management (not submit)
-    "change.*",
+    "change(\\s|$)",
 ]
 
 [shell.docker]
 # Compose-only policy: scoped to the workspace's docker-compose.yml.
 # No bare run/exec (shell-escape vectors), no push/login/save/export.
+# Verbs anchored with (\s|$) (see [shell.git]).
 mode = "deny"
 allow = [
     # Compose lifecycle
-    "compose up.*", "compose down.*", "compose build.*",
-    "compose ps.*", "compose logs.*", "compose exec.*",
-    "compose run.*", "compose stop.*", "compose restart.*",
-    "compose pull.*", "compose config.*", "compose top.*",
-    "compose images.*", "compose port.*", "compose version.*",
+    "compose up(\\s|$)", "compose down(\\s|$)", "compose build(\\s|$)",
+    "compose ps(\\s|$)", "compose logs(\\s|$)", "compose exec(\\s|$)",
+    "compose run(\\s|$)", "compose stop(\\s|$)", "compose restart(\\s|$)",
+    "compose pull(\\s|$)", "compose config(\\s|$)", "compose top(\\s|$)",
+    "compose images(\\s|$)", "compose port(\\s|$)", "compose version(\\s|$)",
     # Container/image inspection (read-only)
-    "ps.*", "inspect.*", "logs.*", "top.*", "stats.*", "port.*",
-    "images.*", "image ls.*", "image inspect.*", "image history.*",
+    "ps(\\s|$)", "inspect(\\s|$)", "logs(\\s|$)", "top(\\s|$)", "stats(\\s|$)", "port(\\s|$)",
+    "images(\\s|$)", "image ls(\\s|$)", "image inspect(\\s|$)", "image history(\\s|$)",
     # Volume & network inspection (read-only)
-    "volume ls.*", "volume inspect.*",
-    "network ls.*", "network inspect.*",
+    "volume ls(\\s|$)", "volume inspect(\\s|$)",
+    "network ls(\\s|$)", "network inspect(\\s|$)",
     # System info (read-only)
-    "system df.*", "version.*", "info.*",
+    "system df(\\s|$)", "version(\\s|$)", "info(\\s|$)",
 ]
 
 # Path-like command patterns trigger automatic write protection — run_python cannot

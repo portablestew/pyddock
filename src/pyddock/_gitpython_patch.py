@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import re
 import sys
+from pathlib import Path
 from typing import Any, Callable
 
 from pyddock._base import _find_deny_hint
-from pyddock.shell_executor import args_match_allow, args_match_deny
+from pyddock.shell_executor import args_match_allow, args_match_deny, evaluate_arg_paths
 
 # Global git options (before the subcommand) that enable command/config
 # injection — effectively arbitrary code execution — and must never be allowed
@@ -64,6 +65,7 @@ def _basename_noext(path: str) -> str:
 
 def build_git_command_validator(
     config: dict,
+    workspace_root: str | Path | None = None,
     deny_messages: list[tuple[re.Pattern[str], str]] | None = None,
 ) -> Callable[[Any], None]:
     """Build a validator for GitPython command vectors.
@@ -78,6 +80,18 @@ def build_git_command_validator(
     3. leading global options are vetted: injection-class options are rejected,
        known value/flag options are consumed, unknown ones are rejected
     4. the subcommand + its args must match an allow pattern from [shell.git]
+    5. path-like args are scanned against the [shell.git] arg_paths policy
+       (same scan as run_shell / subprocess.run) so a permitted subcommand
+       cannot write into .pyddock/, workspace module dirs, script dirs, or
+       (in "workspace" mode) anywhere outside the workspace.
+
+    Args:
+        config: Serialized pyddock config dict.
+        workspace_root: Workspace root for arg-path resolution. When None, the
+            path scan (step 5) is skipped — this keeps the validator usable in
+            unit tests that only exercise command/allow validation. Production
+            callers (apply_all) always pass it.
+        deny_messages: Pre-compiled (pattern, message) deny hints.
     """
     deny_msgs = deny_messages or []
     policy = config.get("shell", {}).get("git")
@@ -86,6 +100,14 @@ def build_git_command_validator(
     # the command, regardless of subcommand. Catches RCE/transport tokens that a
     # per-subcommand allow pattern would otherwise wave through.
     deny_list = policy.get("deny", []) if policy else []
+    # arg_paths scanning config (enforced at the policy's configured level —
+    # default "workspace"). Mirrors run_shell / subprocess.run path scanning.
+    arg_paths_mode = policy.get("arg_paths", "workspace") if policy else "workspace"
+    _ws_root = Path(workspace_root) if workspace_root is not None else None
+    _workspace_imports = config.get("imports", {}).get("workspace", {})
+    _shell_command_patterns = [
+        p.get("command", "") for p in config.get("shell", {}).values()
+    ]
 
     def _reject(msg: str, attempted: str = "") -> None:
         full = f"PermissionError: {msg}"
@@ -163,11 +185,30 @@ def build_git_command_validator(
                 attempted=f"git {args_str}",
             )
 
+        # 6. Scan path-like args against the arg_paths policy (parity with
+        # run_shell / subprocess.run). Without this, an allowed subcommand could
+        # carry a path argument into a protected directory — e.g.
+        # `git add .pyddock/x` or a write into a workspace module dir — because
+        # git is a native subprocess that bypasses the Python filesystem patches.
+        # Scans the subcommand + its args (cmd[i:]); the subcommand token itself
+        # is not path-like so it is harmlessly ignored.
+        if _ws_root is not None:
+            path_rejection = evaluate_arg_paths(
+                cmd[i:],
+                arg_paths=arg_paths_mode,
+                workspace_root=_ws_root,
+                workspace_module_dirs=_workspace_imports,
+                shell_command_patterns=_shell_command_patterns,
+            )
+            if path_rejection is not None:
+                _reject(path_rejection, attempted=f"git {args_str}")
+
     return _validate
 
 
 def apply_gitpython_patch(
     config: dict,
+    workspace_root: str | Path | None = None,
     deny_messages: list[tuple[re.Pattern[str], str]] | None = None,
 ) -> bool:
     """Wrap git.cmd.Git.execute to validate commands against the shell policy.
@@ -198,7 +239,7 @@ def apply_gitpython_patch(
     if getattr(_orig_execute, "_pyddock_guarded", False):
         return True  # already patched
 
-    _validate = build_git_command_validator(config, deny_messages)
+    _validate = build_git_command_validator(config, workspace_root, deny_messages)
 
     def _guarded_execute(self: Any, command: Any, *args: Any, **kwargs: Any) -> Any:
         _validate(command)
