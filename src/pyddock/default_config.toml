@@ -49,7 +49,6 @@ statistics = true
 string = true
 struct = true
 textwrap = true
-threading = true
 time = true
 types = true
 typing = true
@@ -61,7 +60,7 @@ subprocess = true
 sys = true
 tempfile = true
 # Third-party — controlled via [restrictions] sections below
-#boto3 = true # Enable for AWS (opens network access vectors, when with reasonable restrictions)
+#boto3 = true # Enable for AWS (opens network access vectors, even with reasonable restrictions)
 cryptography = true # No I/O of its own; all file access goes through Python builtins
 git = "GitPython" # Shell policy enforces command restrictions via Popen
 polars = true
@@ -106,7 +105,13 @@ readable_paths = ["*"]
 # These prevent trivial jailbreaks (e.g. eval("__import__('os').system(...)")).
 [ast]
 block_calls = ["eval", "exec", "compile", "breakpoint", "__import__"]
-block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "__mro__", "__closure__"]
+# Frame/traceback/generator attributes are blocked to prevent sandbox escape via
+# stack walking: an exception's traceback (e.__traceback__.tb_frame) or a
+# generator/coroutine frame exposes f_globals/f_locals/f_back, which leak module
+# namespaces (including enforcement internals and real module references).
+# Blocking tb_frame/gi_frame/cr_frame/ag_frame severs traceback/generator -> frame;
+# blocking f_back/f_globals/f_locals/f_builtins neutralizes any frame still obtained.
+block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "__mro__", "__closure__", "f_globals", "f_locals", "f_back", "f_builtins", "tb_frame", "gi_frame", "cr_frame", "ag_frame"]
 
 # Per-library runtime restrictions.
 # mode = "allow": permit everything except functions matching deny patterns.

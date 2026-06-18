@@ -21,6 +21,7 @@ from pyddock._import_hook import _ImportBlocker, _caller_is_trusted
 from pyddock._proxies import (
     MethodFilterProxy, FactoryProxy, _CallerScopedModuleProxy,
     _expand_patterns, _build_trusted_prefixes, _proxy_module_universal,
+    _compute_exported_api,
 )
 from pyddock._fs_enforcement import apply_filesystem_scoping
 from pyddock._subprocess_patch import apply_subprocess_patch
@@ -457,7 +458,6 @@ class RuntimeEnforcement:
             "getenv", "urandom",
             "listdir", "scandir", "walk",
             "stat", "lstat", "fstat",
-            "path",  # os.path submodule (pure path manipulation)
         ]
         for attr in _safe_funcs:
             if hasattr(_real_os, attr):
@@ -467,14 +467,52 @@ class RuntimeEnforcement:
         MappingProxyType = self._types_module.MappingProxyType
         safe_os.environ = MappingProxyType(dict(_real_os.environ))
 
+        # os.path — wrap in a caller-scoped proxy instead of handing out the raw
+        # ntpath/posixpath module.
+        #
+        # SECURITY: the raw path module re-exports the modules it imports at
+        # module scope (os.path.os, os.path.sys, os.path.genericpath, ...).
+        # `os.path.os` therefore handed agent code the *real* os module — a
+        # sandbox-escape vector to the unpatched low-level file primitives
+        # (os.open/os.write). The caller-scoped proxy exposes only the path
+        # manipulation API (join, exists, dirname, abspath, ...) to agent code;
+        # the leaked sub-module references are non-ModuleType-filtered out of the
+        # exported API and are only reachable from trusted (stdlib/site-packages)
+        # callers, which legitimately need them.
+        real_path = getattr(_real_os, "path", None)
+        if real_path is not None:
+            path_api = _compute_exported_api(
+                real_path,
+                exclude_foreign_classes=False,
+                include_private=False,
+            )
+            path_proxy = _CallerScopedModuleProxy(
+                module_name=getattr(real_path, "__name__", "os.path"),
+                real_module=real_path,
+                always_allowed=path_api,
+                always_blocked=frozenset(),
+                trusted_prefixes=tuple(self._trusted_prefixes),
+            )
+            setattr(safe_os, "path", path_proxy)
+        else:
+            path_proxy = None
+
         # Workspace-scoped directory operations are patched in apply_filesystem_scoping()
         # where the full _check_write logic (including .pyddock/ and workspace module
         # protection) is available. Here we just expose stubs that will be replaced.
 
         # Put the safe proxy where 'import os' will find it
         sys.modules["os"] = safe_os
-        # Also update os.path reference to use the real os.path
-        sys.modules["os.path"] = _real_os.path
+        # Route os.path (and the underlying ntpath/posixpath name) through the
+        # wrapped proxy so neither `import os; os.path.os` nor
+        # `import os.path; os.path.os` leaks the real os module.
+        if path_proxy is not None:
+            sys.modules["os.path"] = path_proxy
+            _real_path_name = getattr(real_path, "__name__", None)
+            if _real_path_name:
+                sys.modules[_real_path_name] = path_proxy
+        else:
+            sys.modules["os.path"] = _real_os.path
 
     def apply_restrictions(self) -> None:
         """Apply module-level and class-level restrictions.
