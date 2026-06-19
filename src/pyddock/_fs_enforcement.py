@@ -16,6 +16,7 @@ from typing import Any
 
 from pyddock._base import _ORIGINALS, _PYDDOCK_DIR, _find_deny_hint, canonical_path
 from pyddock._import_hook import _caller_is_trusted
+from pyddock._audit_enforcement import install_audit_enforcement
 
 
 def apply_filesystem_scoping(
@@ -602,3 +603,15 @@ def apply_filesystem_scoping(
 
     if "os" in sys.modules:
         sys.modules["os"].chmod = _safe_chmod
+
+    # Install the audit-hook backstop LAST, sharing the same _check_* closures.
+    # Audit events fire beneath the Python name layer, so this catches bypasses
+    # that re-derive the real _io.FileIO from a live object or use low-level
+    # os.open/os.replace — operations the monkeypatches above cannot see.
+    install_audit_enforcement(
+        check_read=_check_read,
+        check_write=_check_write,
+        is_write_mode=_is_write_mode,
+        pyddock_dir=_PYDDOCK_DIR,
+        real_os=_real_os,
+    )
