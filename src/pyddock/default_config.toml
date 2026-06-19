@@ -463,15 +463,31 @@ deny = ["DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT"]
 #        layer (captured-reference spawns like GitPython) enforces these locks only.
 [env]
 default = "inert"
+# Patterns are re.fullmatch against the KEY name, matched CASE-INSENSITIVELY
+# (see _env_key_locked) — Windows env names are case-insensitive, so a
+# case-sensitive lock would be bypassable via `Path`/`home`. No (?i) needed here.
 deny = [
-    "PATH", "PATHEXT",            # command resolution hijack
-    "LD_.*", "DYLD_.*",           # ELF / Mach-O loader injection (LD_PRELOAD, ...)
-    "PSModulePath",               # PowerShell module hijack (.ps1 mapping)
-    "PYTHON.*",                   # python mapping (.py) — startup/home/path
-    "TMPDIR", "TEMP", "TMP",      # scratch-file redirection
+    # --- command / library resolution (PATH family + dynamic loaders) ---
+    ".*PATH.*",                   # PATH, PATHEXT, PYTHONPATH, PSModulePath, GIT_EXEC_PATH,
+                                  #   HOMEPATH, CLASSPATH, NODE_PATH, MANPATH, ... (resolution hijack)
+    "LD_.*", "DYLD_.*",           # ELF / Mach-O loader injection (LD_PRELOAD, DYLD_INSERT_LIBRARIES, ...)
+    "PYTHON.*",                   # python (.py) startup/home/path (PYTHONSTARTUP, PYTHONHOME, ...)
     "COMSPEC",                    # cmd /c mapping (.bat)
-    "BASH_ENV", "ENV", "BASH_FUNC_.*", "PROMPT_COMMAND",  # shell startup exec
-    "EDITOR", "VISUAL", "PAGER",  # generic external-command hooks
+    # --- home / config discovery (redirect a tool to attacker-controlled config) ---
+    ".*HOME.*",                   # HOME, HOMEDRIVE, HOMEPATH, GNUPGHOME, JAVA_HOME, XDG_*_HOME, ...
+    "USERPROFILE",                # Windows home fallback — git global ~/.gitconfig discovery
+    "XDG_.*",                     # XDG_CONFIG_HOME/_DIRS, XDG_DATA_HOME/_DIRS, XDG_CACHE_HOME (config/data discovery)
+    # --- shell / interpreter startup & option injection ---
+    "BASH.*", "ENV", "PROMPT_COMMAND",  # shell startup exec (BASH_ENV, BASH_FUNC_*, ...)
+    "PERL5.*",                    # PERL5OPT (-M<module> runs code), PERL5LIB
+    "_?JAVA.*",                   # JAVA_TOOL_OPTIONS, _JAVA_OPTIONS (JVM arg injection); JAVA_HOME also via .*HOME.*
+    "NODE_OPTIONS",               # node --require / --import code injection
+    "RUBY.*",                     # RUBYOPT (-r<lib> runs code), RUBYLIB
+    "LESS.*",                     # LESSOPEN / LESSCLOSE input-preprocessor command exec
+    # --- scratch-file redirection ---
+    "TMPDIR", "TEMP", "TMP",
+    # --- generic external-command hooks ---
+    "EDITOR", "VISUAL", "PAGER",
 ]
 
 # Custom denial hints — appended to rejection messages when the pattern matches

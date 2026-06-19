@@ -201,8 +201,14 @@ class TestBundledDefaultPolicy:
 
     def test_global_env_present(self, cfg) -> None:
         assert cfg.env.default == "inert"
-        assert "PATH" in cfg.env.deny
-        assert any(p == "LD_.*" for p in cfg.env.deny)
+        # PATH-family / loader / home vars are locked via (case-insensitive)
+        # regex rather than literal names. Assert the behavior, not the spelling.
+        for key in ("PATH", "Path", "LD_PRELOAD", "HOME", "home", "PYTHONSTARTUP"):
+            with pytest.raises(PermissionError):
+                filter_child_env(
+                    {key: "evilvalue"}, SNAPSHOT,
+                    deny_patterns=cfg.env.deny, default=cfg.env.default,
+                )
 
     @pytest.mark.parametrize(
         "command,key",

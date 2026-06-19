@@ -221,8 +221,17 @@ def _coerce_env_item(raw_key: Any, raw_value: Any) -> tuple[str, str]:
 
 
 def _env_key_locked(key: str, deny_patterns: list[str]) -> bool:
-    """True if `key` matches (full-match) any hard-lock deny pattern."""
-    return any(re.fullmatch(p, key) for p in deny_patterns)
+    """True if `key` matches (full-match) any hard-lock deny pattern.
+
+    Matching is case-INSENSITIVE. Windows environment variable names are
+    case-insensitive, so a case-sensitive lock on ``PATH``/``HOME`` would be
+    trivially bypassed by supplying ``Path``/``home``. Locking is fail-safe (the
+    child keeps the snapshot value), so the rare POSIX case where a genuinely
+    distinct lowercase variable gets locked is an acceptable trade-off. This
+    applies to both the global ``[env]`` deny list and the per-command
+    ``[shell.<cmd>.env]`` deny lists, which share this helper.
+    """
+    return any(re.fullmatch(p, key, re.IGNORECASE) for p in deny_patterns)
 
 
 def _policy_env(policy: Any) -> dict | None:
