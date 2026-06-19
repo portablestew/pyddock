@@ -39,6 +39,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Workspace root directory. Snippets run with this as CWD.",
     )
+    serve_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log every observed filesystem/process/network audit event (with "
+             "allow/deny decision and caller class) as JSONL to "
+             ".pyddock/tmp/audit.jsonl.",
+    )
 
     # --- run subcommand ---
     run_parser = subparsers.add_parser(
@@ -62,6 +69,12 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="config_path",
         help="Path to a pyddock TOML config file (overrides resolution).",
     )
+    run_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log every observed filesystem/process/network audit event as "
+             "JSONL to .pyddock/tmp/audit.jsonl.",
+    )
     # Everything after -- is passed as args to the snippet
     run_parser.add_argument(
         "snippet_args",
@@ -72,14 +85,14 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cmd_serve(workspace: str | None) -> None:
+def _cmd_serve(workspace: str | None, debug: bool = False) -> None:
     """Run the MCP server on stdio transport."""
     from pyddock.server import create_server
 
     # Use os.path.abspath (not Path.resolve) to normalize .. without resolving symlinks/subst
     import os as _os
     ws = Path(_os.path.abspath(workspace)) if workspace else None
-    server = create_server(ws)
+    server = create_server(ws, debug=debug)
     server.run(transport="stdio")
 
 
@@ -88,6 +101,7 @@ def _cmd_run(
     timeout: float | None,
     config_path: str | None,
     snippet_args: list[str],
+    debug: bool = False,
 ) -> int:
     """Execute a snippet or file using the same pipeline as the MCP tool.
 
@@ -138,7 +152,7 @@ def _cmd_run(
 
     # Execute
     effective_timeout = timeout if timeout is not None else config.execution.timeout
-    executor = SubprocessExecutor(config, venv_manager)
+    executor = SubprocessExecutor(config, venv_manager, debug=debug)
 
     # Strip leading '--' from snippet_args if present
     args = snippet_args
@@ -168,13 +182,14 @@ def main() -> None:
         sys.exit(1)
 
     if args.command == "serve":
-        _cmd_serve(workspace=args.workspace)
+        _cmd_serve(workspace=args.workspace, debug=args.debug)
     elif args.command == "run":
         exit_code = _cmd_run(
             code_or_file=args.code_or_file,
             timeout=args.timeout,
             config_path=args.config_path,
             snippet_args=args.snippet_args,
+            debug=args.debug,
         )
         sys.exit(exit_code)
 

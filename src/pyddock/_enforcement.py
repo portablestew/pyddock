@@ -42,8 +42,9 @@ class RuntimeEnforcement:
     Call apply_all() to install all enforcement hooks in order.
     """
 
-    def __init__(self, config: dict, workspace_root: str) -> None:
+    def __init__(self, config: dict, workspace_root: str, debug: bool = False) -> None:
         self._config = config
+        self._debug = debug
         # Use abspath (not resolve) to preserve symlinks/subst drives
         import os as _os_init
         self._workspace_root = pathlib.Path(_os_init.path.abspath(workspace_root))
@@ -94,6 +95,7 @@ class RuntimeEnforcement:
             real_os=self._real_os,
             trusted_prefixes=self._trusted_prefixes,
             io_module=self._io_module,
+            debug=self._debug,
         )
         self.apply_restrictions()
         # Per-library enforcement guards (the rare escape hatch for libraries the

@@ -45,6 +45,9 @@ readable_paths = ["*"]
 [ast]
 block_calls = ["eval", "exec", "compile", "breakpoint", "__import__"]
 block_attributes = []
+
+[audit]
+"open" = "fs"
 """,
         encoding="utf-8",
     )
@@ -391,6 +394,9 @@ readable_paths = ["."]
 [ast]
 block_calls = ["eval", "exec", "compile", "breakpoint", "__import__"]
 block_attributes = []
+
+[audit]
+"open" = "fs"
 """,
             encoding="utf-8",
         )

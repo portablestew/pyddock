@@ -63,6 +63,24 @@ class ASTConfig:
     block_attributes: list[str] = field(default_factory=list)
 
 
+# Audit-event dispositions. Mirrors VALID_DISPOSITIONS in _audit_enforcement.
+_VALID_AUDIT_DISPOSITIONS = (
+    "fs", "fs-write", "fs-write-pair", "agent-deny", "network", "observe", "allow",
+)
+
+
+@dataclass
+class AuditConfig:
+    """Audit-event policy table.
+
+    Ordered (event-pattern, disposition) rules. A pattern ending in ``*`` is a
+    prefix match (e.g. ``ctypes.*``). Consumed by the sys.addaudithook engine in
+    _audit_enforcement; see VALID_DISPOSITIONS there.
+    """
+
+    rules: list[tuple[str, str]] = field(default_factory=list)
+
+
 @dataclass
 class RestrictionConfig:
     """Per-module restriction configuration."""
@@ -124,6 +142,7 @@ class PyddockConfig:
     restrictions: dict[str, RestrictionConfig] = field(default_factory=dict)
     shell: dict[str, ShellPolicyConfig] = field(default_factory=dict)
     deny_messages: list[DenyMessageRule] = field(default_factory=list)
+    audit: AuditConfig = field(default_factory=AuditConfig)
 
 
 def _parse_execution(data: dict) -> ExecutionConfig:
@@ -375,6 +394,27 @@ def _parse_deny_messages(data: dict) -> list[DenyMessageRule]:
     return rules
 
 
+def _parse_audit(data: dict) -> AuditConfig:
+    """Parse the [audit] section (table of event-pattern → disposition)."""
+    section = data.get("audit", {})
+    if not isinstance(section, dict):
+        raise ConfigError("[audit] must be a table")
+    rules: list[tuple[str, str]] = []
+    for pattern, disposition in section.items():
+        if not isinstance(disposition, str):
+            raise ConfigError(
+                f"[audit].'{pattern}' must be a string disposition, "
+                f"got {type(disposition).__name__}"
+            )
+        if disposition not in _VALID_AUDIT_DISPOSITIONS:
+            raise ConfigError(
+                f"[audit].'{pattern}' has invalid disposition '{disposition}'; "
+                f"valid: {', '.join(_VALID_AUDIT_DISPOSITIONS)}"
+            )
+        rules.append((pattern, disposition))
+    return AuditConfig(rules=rules)
+
+
 def _deep_merge(base: dict, overlay: dict) -> dict:
     """Recursively merge *overlay* on top of *base* (neither is mutated).
 
@@ -391,8 +431,32 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return merged
 
 
+# Sections that carry sandbox policy or security-relevant defaults. They must be
+# present in the resolved config (a workspace config is a full replacement of the
+# bundled default, so a missing section is a silent downgrade). The program fails
+# closed — halts at load — if any are absent. A present-but-empty section is a
+# valid, explicit opt-out. Additive sections (restrictions, shell, deny_messages)
+# are optional: empty unambiguously means "none".
+_REQUIRED_SECTIONS = ("execution", "imports", "filesystem", "ast", "audit")
+
+
+def _check_required_sections(data: dict) -> None:
+    """Fail closed if any policy-bearing section is missing from the config."""
+    missing = [s for s in _REQUIRED_SECTIONS if s not in data]
+    if missing:
+        rendered = ", ".join(f"[{s}]" for s in missing)
+        raise ConfigError(
+            f"Config is missing required section(s): {rendered}. These declare the "
+            f"sandbox policy and must be present (a workspace config fully replaces "
+            f"the bundled default, so an omitted section would silently weaken "
+            f"enforcement). Add the section — use an empty section to opt out "
+            f"explicitly."
+        )
+
+
 def _parse_config(data: dict) -> PyddockConfig:
     """Parse a raw TOML dict into a PyddockConfig."""
+    _check_required_sections(data)
     return PyddockConfig(
         execution=_parse_execution(data),
         imports=_parse_imports(data),
@@ -401,6 +465,7 @@ def _parse_config(data: dict) -> PyddockConfig:
         restrictions=_parse_restrictions(data),
         shell=_parse_shell(data),
         deny_messages=_parse_deny_messages(data),
+        audit=_parse_audit(data),
     )
 
 

@@ -128,6 +128,108 @@ block_calls = ["eval", "exec", "compile", "breakpoint", "__import__"]
 # The durable fix is OS-level write enforcement.
 block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "__base__", "__mro__", "__closure__", "__getattribute__", "__getattr__", "f_globals", "f_locals", "f_back", "f_builtins", "tb_frame", "gi_frame", "cr_frame", "ag_frame"]
 
+# Audit-event policy table — enforced via sys.addaudithook, which fires beneath
+# the Python name layer. This is the authoritative chokepoint that the
+# monkeypatched open/FileIO/os cannot match: it catches operations that reach a
+# real primitive through a live-object leak (e.g. type(sys.stdout.buffer.raw))
+# or low-level os.open/os.replace.
+#
+# Each key is an audit event name (see the Python "Audit events table":
+# https://docs.python.org/3/library/audit_events.html). A key may end in `*`
+# for a prefix match (e.g. "ctypes.*" matches "ctypes.dlopen"); no other
+# glob/regex syntax is supported. Dispositions:
+#   fs            — open(): path-scoped read/write check (by mode/flags)
+#   fs-write      — single-path mutation: check the target against write scope
+#   fs-write-pair — two-path mutation (rename/link/symlink): check both targets
+#   agent-deny    — deny when the caller is AGENT code; allow trusted libraries,
+#                   stdlib, and import machinery. For primitives with no
+#                   sanctioned agent use (defense-in-depth behind the import
+#                   allowlist).
+#   network       — network egress: deny from agent code, allow trusted
+#                   libraries (host/port scoping is a future refinement)
+#   observe       — log only under `serve --debug`; no enforcement
+#   allow         — explicit no-op (override a default to permit)
+#
+# Events not listed are ignored (hot events like object.__getattr__/builtins.id
+# must stay absent). This table is the single source of truth: if a workspace
+# config replaces the bundled default and omits [audit], the audit hook is
+# inactive (the _fs_enforcement monkeypatches still provide first-line file
+# scoping). Include [audit] to keep the audit-layer backstop.
+[audit]
+# --- filesystem scoping (the backstop for the _io.FileIO bypass) ---
+"open" = "fs"
+"os.rename" = "fs-write-pair"
+"os.link" = "fs-write-pair"
+"os.symlink" = "fs-write-pair"
+"os.remove" = "fs-write"
+"os.unlink" = "fs-write"
+"os.mkdir" = "fs-write"
+"os.rmdir" = "fs-write"
+"os.chmod" = "fs-write"
+"os.chown" = "fs-write"
+"os.truncate" = "fs-write"
+# --- native code / arbitrary memory (defeats all enforcement) ---
+"ctypes.*" = "agent-deny"
+"mmap.__new__" = "agent-deny"
+# --- dynamic code construction (AST can't see these runtime paths) ---
+"code.__new__" = "agent-deny"
+"function.__new__" = "agent-deny"
+"marshal.loads" = "agent-deny"
+"marshal.load" = "agent-deny"
+"pickle.find_class" = "agent-deny"
+# --- interpreter introspection / hook tampering / remote code ---
+"sys.settrace" = "agent-deny"
+"sys.setprofile" = "agent-deny"
+"sys.monitoring.register_callback" = "agent-deny"
+"sys.addaudithook" = "agent-deny"
+"sys.remote_exec" = "agent-deny"
+"setopencodehook" = "agent-deny"
+"cpython.remote_debugger_script" = "agent-deny"
+"cpython._PySys_ClearAuditHooks" = "agent-deny"
+"cpython.PyConfig_Set" = "agent-deny"
+# --- native library loading via sqlite ---
+"sqlite3.load_extension" = "agent-deny"
+"sqlite3.enable_load_extension" = "agent-deny"
+# --- process creation / control beyond the shell policy ---
+"os.fork" = "agent-deny"
+"os.forkpty" = "agent-deny"
+"pty.spawn" = "agent-deny"
+"os.startfile" = "agent-deny"
+"webbrowser.open" = "agent-deny"
+"builtins.breakpoint" = "agent-deny"
+"pdb.Pdb" = "agent-deny"
+# --- network egress: deny from agent code, allow trusted libraries (agents
+#     have no socket path of their own). Host/port scoping is a future
+#     refinement of the `network` disposition. ---
+"socket.connect" = "network"
+"socket.bind" = "network"
+"socket.sendto" = "network"
+"socket.sendmsg" = "network"
+"urllib.Request" = "network"
+# --- observe-only: process spawn (enforced by the shell policy/patch today),
+#     DNS, and recon/env surfaces. These only emit log lines under
+#     `serve --debug`. ---
+"subprocess.Popen" = "observe"
+"os.exec" = "observe"
+"os.system" = "observe"
+"os.posix_spawn" = "observe"
+"os.spawn" = "observe"
+# import: enforced today by the import allowlist (builtins.__import__ guard +
+# sys.meta_path finder). Observed here to inventory volume/callers before
+# deciding on an audit-layer backstop (a future task).
+"import" = "observe"
+"socket.getaddrinfo" = "observe"
+"socket.gethostbyname" = "observe"
+"os.scandir" = "observe"
+"os.listdir" = "observe"
+"os.walk" = "observe"
+"glob.glob" = "observe"
+"os.chdir" = "observe"
+"os.putenv" = "observe"
+"os.unsetenv" = "observe"
+"os.add_dll_directory" = "observe"
+"winreg.*" = "observe"
+
 # Per-library runtime restrictions.
 # mode = "allow": permit everything except functions matching deny patterns.
 # mode = "deny": block everything except functions matching allow patterns.

@@ -95,6 +95,7 @@ Pyddock also exposes file I/O tools that execute through the same sandbox as `ru
 
 - **AST validation** (pre-execution) — rejects disallowed imports, blocked calls (`eval`, `exec`, `compile`), and blocked attribute access (`__globals__`, `__subclasses__`, etc.)
 - **Runtime enforcement** (in-subprocess) — import hook, filesystem scoping, `getattr`/`attrgetter` guards, factory proxies for library method restrictions, safe `sys`/`os`/`subprocess` module proxies
+- **Audit-hook policy engine** (in-subprocess) — a `sys.addaudithook` that enforces the `[audit]` disposition table at the CPython audit-event layer, *beneath* the Python name bindings. This is the authoritative backstop for the name-based monkeypatches above: it catches operations that reach a real primitive through a live-object leak (e.g. `type(sys.stdout.buffer.raw)(...)` → the genuine `_io.FileIO`) or low-level `os.open`/`os.replace`. See [Audit policy](#audit-policy).
 
 `run_shell` and subprocess enforcement:
 
@@ -108,6 +109,22 @@ Pyddock also exposes file I/O tools that execute through the same sandbox as `ru
 Writes are restricted to the workspace. The `.pyddock/` directory, pyddock source, and the Python stdlib directory are always write-protected (`.pyddock/tmp/` is the exception, used by tempfile). Reads are unrestricted by default but subject to filesystem guards.
 
 **Filesystem guards** (`[filesystem.guards]`) provide regex-based path rules that apply to both reads and writes. Each pattern maps to a disposition: `"deny-agent"` (block agent code; trusted libraries bypass), `"deny-all"` (block unconditionally), `"workspace"` (allow only inside the workspace), or `"allow"` (permit unconditionally). First match listed in the toml wins. Assorted secrets are blocked by default (`~/.ssh/`, `~/.aws/credentials`, `~/.gnupg/`, etc.). `.env` files are restricted to workspace-only access.
+
+## Audit policy
+
+The `[audit]` section maps CPython audit events (see the [Audit events table](https://docs.python.org/3/library/audit_events.html)) to a **disposition**. It is enforced by a `sys.addaudithook` that fires beneath the Python name bindings, so it cannot be bypassed by re-deriving a real primitive from a live object. Each key is an audit event name; a key ending in `*` is a prefix match (e.g. `"ctypes.*"`). Dispositions:
+
+- **`fs`** — `open()`: path-scoped read/write check (by mode/flags).
+- **`fs-write`** — single-path mutation (`os.remove`, `os.mkdir`, …): check the target.
+- **`fs-write-pair`** — two-path mutation (`os.rename`/`replace`, `os.link`, …): check both.
+- **`agent-deny`** — deny when the caller is agent code; allow trusted libraries, stdlib, and import machinery. For primitives with no sanctioned agent use (`ctypes.*`, `marshal.loads`, `code.__new__`, `sys.settrace`, …). Defense-in-depth behind the import allowlist.
+- **`network`** — network egress (`socket.connect`/`bind`/`sendto`, `urllib.Request`): same caller-scoped deny as `agent-deny` (agents have no socket path; trusted libraries are allowed).
+- **`observe`** — log only under `serve --debug`; no enforcement.
+- **`allow`** — explicit no-op (override a default to permit).
+
+`[audit]` is the single source of truth — events not listed are ignored, and a config that omits the section entirely runs without the audit backstop. The five policy-bearing sections (`[execution]`, `[imports]`, `[filesystem]`, `[ast]`, `[audit]`) are **required**: pyddock halts at startup if any is absent (a present-but-empty section is a valid explicit opt-out).
+
+**Debug logging:** `pyddock serve --debug` (or `pyddock run --debug`) records every observed event — filesystem, process, and network — as JSONL to `.pyddock/tmp/audit.jsonl`, with the allow/deny decision and a caller classification (`AGENT` / `TRUSTED` / `IMPORT`). Useful for auditing what agent code and dependencies actually do. Off by default with no overhead.
 
 ## Configuration
 
@@ -148,6 +165,14 @@ readable_paths = ["*"]
 [ast]
 block_calls = ["eval", "exec", "compile", "breakpoint", "__import__"]
 block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "__mro__", "__closure__"]
+
+[audit]                  # audit event → disposition (see "Audit policy" below)
+"open" = "fs"
+"os.rename" = "fs-write-pair"
+"ctypes.*" = "agent-deny"
+"marshal.loads" = "agent-deny"
+"socket.connect" = "network"
+"subprocess.Popen" = "observe"
 
 [restrictions.polars]
 mode = "allow"
@@ -250,6 +275,7 @@ When `subprocess` is enabled in `[imports]`, `run_python` code can call `subproc
 
 ```sh
 pyddock serve --workspace /path/to/project   # MCP server (stdio)
+pyddock serve --workspace /path/to/project --debug   # + JSONL audit trail to .pyddock/tmp/audit.jsonl
 pyddock run "2 + 2"                          # Direct execution
 pyddock run script.py -- arg1 arg2           # File execution with args
 ```

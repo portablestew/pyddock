@@ -20,6 +20,8 @@ from pyddock.config import (
 )
 from pyddock.shell_executor import ShellExecutor
 
+from tests._config_helpers import write_workspace_config
+
 
 def _make_config(
     shell: dict[str, ShellPolicyConfig] | None = None,
@@ -75,15 +77,13 @@ class TestDenyMessagesConfigParsing:
 
     def test_valid_section_parsed(self, tmp_path: Path) -> None:
         """Valid [deny_messages] section is parsed into DenyMessageRule list."""
-        workspace_cfg = tmp_path / ".pyddock" / "pyddock.toml"
-        workspace_cfg.parent.mkdir(parents=True)
-        workspace_cfg.write_text(
-            "[execution]\ntimeout = 30\n\n[imports]\njson = true\n\n"
-            "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['.']\n\n"
-            "[ast]\nblock_calls = []\nblock_attributes = []\n\n[restrictions]\n\n"
-            '[deny_messages]\n'
-            '"aws" = "Use boto3 instead."\n'
-            '"git push" = "Push is not allowed."\n'
+        write_workspace_config(
+            tmp_path,
+            extra=(
+                "[deny_messages]\n"
+                '"aws" = "Use boto3 instead."\n'
+                '"git push" = "Push is not allowed."\n'
+            ),
         )
 
         config = load_config(tmp_path)
@@ -93,14 +93,8 @@ class TestDenyMessagesConfigParsing:
 
     def test_invalid_regex_raises(self, tmp_path: Path) -> None:
         """Invalid regex pattern in deny_messages raises ConfigError."""
-        workspace_cfg = tmp_path / ".pyddock" / "pyddock.toml"
-        workspace_cfg.parent.mkdir(parents=True)
-        workspace_cfg.write_text(
-            "[execution]\ntimeout = 30\n\n[imports]\njson = true\n\n"
-            "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['.']\n\n"
-            "[ast]\nblock_calls = []\nblock_attributes = []\n\n[restrictions]\n\n"
-            '[deny_messages]\n'
-            '"(unclosed" = "bad regex"\n'
+        write_workspace_config(
+            tmp_path, extra='[deny_messages]\n"(unclosed" = "bad regex"\n'
         )
 
         with pytest.raises(ConfigError, match="not a valid regex"):
@@ -108,29 +102,14 @@ class TestDenyMessagesConfigParsing:
 
     def test_non_string_value_raises(self, tmp_path: Path) -> None:
         """Non-string value in deny_messages raises ConfigError."""
-        workspace_cfg = tmp_path / ".pyddock" / "pyddock.toml"
-        workspace_cfg.parent.mkdir(parents=True)
-        workspace_cfg.write_text(
-            "[execution]\ntimeout = 30\n\n[imports]\njson = true\n\n"
-            "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['.']\n\n"
-            "[ast]\nblock_calls = []\nblock_attributes = []\n\n[restrictions]\n\n"
-            '[deny_messages]\n'
-            '"aws" = 42\n'
-        )
+        write_workspace_config(tmp_path, extra='[deny_messages]\n"aws" = 42\n')
 
         with pytest.raises(ConfigError, match="must be a string"):
             load_config(tmp_path)
 
     def test_empty_section_produces_empty_list(self, tmp_path: Path) -> None:
         """Empty [deny_messages] section produces empty list."""
-        workspace_cfg = tmp_path / ".pyddock" / "pyddock.toml"
-        workspace_cfg.parent.mkdir(parents=True)
-        workspace_cfg.write_text(
-            "[execution]\ntimeout = 30\n\n[imports]\njson = true\n\n"
-            "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['.']\n\n"
-            "[ast]\nblock_calls = []\nblock_attributes = []\n\n[restrictions]\n\n"
-            "[deny_messages]\n"
-        )
+        write_workspace_config(tmp_path, extra="[deny_messages]\n")
 
         config = load_config(tmp_path)
         assert config.deny_messages == []

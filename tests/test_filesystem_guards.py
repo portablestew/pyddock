@@ -35,6 +35,7 @@ class TestGuardConfigParsing:
             "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['*']\n\n"
             f"{guards_toml}\n\n"
             "[ast]\nblock_calls = []\nblock_attributes = []\n\n"
+            '[audit]\n"open" = "fs"\n\n'
             "[restrictions]\n",
             encoding="utf-8",
         )
@@ -84,6 +85,7 @@ class TestGuardEnforcement:
             "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['*']\n\n"
             f"{guards_toml}\n\n"
             "[ast]\nblock_calls = []\nblock_attributes = []\n\n"
+            '[audit]\n"open" = "fs"\n\n'
             "[restrictions]\n",
             encoding="utf-8",
         )

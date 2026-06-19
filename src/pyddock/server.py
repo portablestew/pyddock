@@ -101,7 +101,7 @@ def _build_shell_tool_description(config: PyddockConfig) -> str:
     return "\n".join(parts)
 
 
-def create_server(workspace: Path | None = None) -> FastMCP:
+def create_server(workspace: Path | None = None, debug: bool = False) -> FastMCP:
     """Create and configure the pyddock MCP server.
 
     Loads config, creates venv, installs allowed packages, and registers
@@ -109,6 +109,7 @@ def create_server(workspace: Path | None = None) -> FastMCP:
 
     Args:
         workspace: Workspace root directory. Defaults to CWD.
+        debug: Enable the audit-trail debug log (.pyddock/tmp/audit.jsonl).
 
     Returns:
         Configured FastMCP server instance.
@@ -137,7 +138,7 @@ def create_server(workspace: Path | None = None) -> FastMCP:
 
     # Create components
     ast_validator = ASTValidator(config)
-    executor = SubprocessExecutor(config, venv_manager)
+    executor = SubprocessExecutor(config, venv_manager, debug=debug)
 
     # Create MCP server
     mcp = FastMCP("pyddock")
@@ -436,12 +437,19 @@ def main() -> None:
         default=None,
         help="Workspace root directory. Snippets run with this as CWD. Defaults to the current directory.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log every observed filesystem/process/network audit event (with "
+             "allow/deny decision and caller class) as JSONL to "
+             ".pyddock/tmp/audit.jsonl.",
+    )
     args = parser.parse_args()
 
     # Use os.path.abspath (not Path.resolve) to normalize .. without resolving symlinks/subst
     import os as _os
     workspace = Path(_os.path.abspath(args.workspace)) if args.workspace else None
-    server = create_server(workspace)
+    server = create_server(workspace, debug=args.debug)
     server.run(transport="stdio")
 
 

@@ -25,6 +25,7 @@ def apply_filesystem_scoping(
     real_os: Any,
     trusted_prefixes: tuple[str, ...],
     io_module: Any,
+    debug: bool = False,
 ) -> None:
     """Patch filesystem operations to enforce path restrictions.
 
@@ -37,6 +38,7 @@ def apply_filesystem_scoping(
     writable_paths = fs_config.get("writable_paths", ["."])
     readable_paths = fs_config.get("readable_paths", ["."])
     _real_os = real_os
+    _NULL_DEVICE = real_os.devnull
 
     def _abspath(p: pathlib.Path) -> pathlib.Path:
         """Canonicalize a path for containment checks.
@@ -215,8 +217,29 @@ def apply_filesystem_scoping(
         except ValueError:
             return False
 
+    def _is_null_device(target: Any) -> bool:
+        """True if the path is the OS null device (nul / /dev/null).
+
+        Writing to the null device is a harmless sink. Subprocess/stdio
+        redirection (e.g. GitPython spawning git with output to os.devnull)
+        opens it via low-level os.open, which the name-based patches never saw
+        but the audit hook does — so allow it explicitly here, for everyone.
+        """
+        s = str(target)
+        if s == _NULL_DEVICE:
+            return True
+        if _real_os.name == "nt":
+            # On Windows 'nul' is a reserved device name in any directory and
+            # with any extension (nul, dir\\nul, nul.txt all hit the device);
+            # real files can't be named that, so a 'nul' component is safe.
+            comp = s.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+            return comp == "nul" or comp.startswith("nul.")
+        return False
+
     def _check_read(path: pathlib.Path) -> None:
         """Raise PermissionError if path is outside readable scope."""
+        if _is_null_device(path):
+            return
         resolved = _abspath(path)
         # Check guards first (first match wins)
         guard_result = _check_guard(resolved, "read")
@@ -235,6 +258,8 @@ def apply_filesystem_scoping(
 
     def _check_write(path: pathlib.Path) -> None:
         """Raise PermissionError if path is outside writable scope."""
+        if _is_null_device(path):
+            return
         resolved = _abspath(path)
         # Check guards first (first match wins)
         guard_result = _check_guard(resolved, "write")
@@ -608,10 +633,24 @@ def apply_filesystem_scoping(
     # Audit events fire beneath the Python name layer, so this catches bypasses
     # that re-derive the real _io.FileIO from a live object or use low-level
     # os.open/os.replace — operations the monkeypatches above cannot see.
+    # Install the audit-hook policy engine LAST, sharing the same _check_*
+    # closures. Audit events fire beneath the Python name layer, so this catches
+    # bypasses that re-derive the real _io.FileIO from a live object or use
+    # low-level os.open/os.replace — and enforces the [audit] disposition table
+    # (fs scoping + agent-deny for primitives with no sanctioned agent use).
+    audit_rules = [
+        (entry["pattern"], entry["disposition"])
+        for entry in config.get("audit", [])
+        if isinstance(entry, dict) and "pattern" in entry and "disposition" in entry
+    ]
     install_audit_enforcement(
         check_read=_check_read,
         check_write=_check_write,
         is_write_mode=_is_write_mode,
         pyddock_dir=_PYDDOCK_DIR,
         real_os=_real_os,
+        audit_rules=audit_rules,
+        trusted_prefixes=trusted_prefixes,
+        debug=debug,
+        log_path=str(workspace_root / ".pyddock" / "tmp" / "audit.jsonl") if debug else None,
     )

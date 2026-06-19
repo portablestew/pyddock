@@ -27,6 +27,8 @@ from pyddock.config import (
 from pyddock.executor import SubprocessExecutor
 from pyddock.venv_manager import VenvManager
 
+from tests._config_helpers import write_workspace_config
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -76,16 +78,10 @@ class TestWorkspaceConfigParsing:
 
     def test_string_value_adds_to_workspace_and_allowed(self, tmp_path: Path) -> None:
         """A string-valued import entry adds the module to both workspace and allowed."""
-        workspace_cfg = tmp_path / ".pyddock" / "pyddock.toml"
-        workspace_cfg.parent.mkdir(parents=True)
-        workspace_cfg.write_text(
-            "[execution]\ntimeout = 30\n\n"
-            "[imports]\n"
-            'json = true\n'
-            'my_tool = ".kiro/scripts/my-tool"\n\n'
-            "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['.']\n\n"
-            "[ast]\nblock_calls = []\nblock_attributes = []\n\n"
-            "[restrictions]\n"
+        write_workspace_config(
+            tmp_path,
+            imports='[imports]\njson = true\nmy_tool = ".kiro/scripts/my-tool"\n',
+            extra="[restrictions]\n",
         )
 
         config = load_config(tmp_path)
@@ -102,17 +98,15 @@ class TestWorkspaceConfigParsing:
 
     def test_multiple_workspace_modules(self, tmp_path: Path) -> None:
         """Multiple string-valued entries all appear in workspace and allowed."""
-        workspace_cfg = tmp_path / ".pyddock" / "pyddock.toml"
-        workspace_cfg.parent.mkdir(parents=True)
-        workspace_cfg.write_text(
-            "[execution]\ntimeout = 30\n\n"
-            "[imports]\n"
-            'invoice_parser = ".kiro/scripts/invoice-parser"\n'
-            'metrics_client = ".kiro/scripts/reporting/metrics-client"\n'
-            'json = true\n\n'
-            "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['.']\n\n"
-            "[ast]\nblock_calls = []\nblock_attributes = []\n\n"
-            "[restrictions]\n"
+        write_workspace_config(
+            tmp_path,
+            imports=(
+                "[imports]\n"
+                'invoice_parser = ".kiro/scripts/invoice-parser"\n'
+                'metrics_client = ".kiro/scripts/reporting/metrics-client"\n'
+                "json = true\n"
+            ),
+            extra="[restrictions]\n",
         )
 
         config = load_config(tmp_path)
@@ -126,16 +120,10 @@ class TestWorkspaceConfigParsing:
 
     def test_empty_string_excluded(self, tmp_path: Path) -> None:
         """An empty string value is treated like false — excluded from both."""
-        workspace_cfg = tmp_path / ".pyddock" / "pyddock.toml"
-        workspace_cfg.parent.mkdir(parents=True)
-        workspace_cfg.write_text(
-            "[execution]\ntimeout = 30\n\n"
-            "[imports]\n"
-            'json = true\n'
-            'excluded_mod = ""\n\n'
-            "[filesystem]\nwritable_paths = ['.']\nreadable_paths = ['.']\n\n"
-            "[ast]\nblock_calls = []\nblock_attributes = []\n\n"
-            "[restrictions]\n"
+        write_workspace_config(
+            tmp_path,
+            imports='[imports]\njson = true\nexcluded_mod = ""\n',
+            extra="[restrictions]\n",
         )
 
         config = load_config(tmp_path)

@@ -42,9 +42,10 @@ class SubprocessExecutor:
         venv_manager: The venv manager providing the Python interpreter path.
     """
 
-    def __init__(self, config: PyddockConfig, venv_manager: VenvManager) -> None:
+    def __init__(self, config: PyddockConfig, venv_manager: VenvManager, debug: bool = False) -> None:
         self._config = config
         self._venv_manager = venv_manager
+        self._debug = debug
 
     def execute(
         self,
@@ -180,6 +181,7 @@ class SubprocessExecutor:
             f"_enforcement = _RE(",
             f"    config={config_dict!r},",
             f"    workspace_root={str(workspace_root)!r},",
+            f"    debug={self._debug!r},",
             f")",
             "_enforcement.apply_all()",
             "",
@@ -271,6 +273,10 @@ class SubprocessExecutor:
             "deny_messages": [
                 {"pattern": rule.pattern.pattern, "message": rule.message}
                 for rule in self._config.deny_messages
+            ],
+            "audit": [
+                {"pattern": p, "disposition": d}
+                for p, d in self._config.audit.rules
             ],
         }
 
