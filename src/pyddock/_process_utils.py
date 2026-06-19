@@ -104,6 +104,15 @@ def _ensure_registry_snapshot() -> None:
             len(_REGISTRY_SNAPSHOT),
             "present" if _REGISTRY_PATH else "absent",
         )
+    except ImportError as exc:
+        # winreg is unimportable here — most commonly because we're running
+        # inside the pyddock sandbox subprocess, where `winreg` is not an
+        # allowed import. os.environ already carries the fully-resolved env the
+        # server passed in, so registry backfill is unnecessary; skip it quietly
+        # (a warning would pollute the snippet's stderr).
+        logger.debug("winreg unavailable; skipping registry backfill: %s", exc)
+        _REGISTRY_SNAPSHOT = {}
+        _REGISTRY_PATH = None
     except Exception as exc:
         logger.warning("Failed to read registry environment: %s", exc)
         _REGISTRY_SNAPSHOT = {}

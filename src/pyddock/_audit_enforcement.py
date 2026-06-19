@@ -64,10 +64,12 @@ from typing import Any, Callable
 
 from pyddock._base import SNIPPET_FILENAME
 from pyddock.shell_executor import (
+    assert_env_locks,
     evaluate_arg_paths,
     evaluate_arg_policy,
     evaluate_cwd,
     find_matching_policy,
+    resolve_env_policy,
 )
 
 # Real C builtin, captured before the sys proxy is installed.
@@ -156,6 +158,9 @@ def evaluate_spawn_command(
     workspace_root: str | None = None,
     workspace_module_dirs: dict[str, str] | None = None,
     proxy_validated: bool = False,
+    env: Any = None,
+    env_base: Any = None,
+    env_snapshot: dict[str, str] | None = None,
 ) -> None:
     """Validate a `subprocess.Popen` audit event against the `[shell.*]` policy.
 
@@ -174,12 +179,12 @@ def evaluate_spawn_command(
     an allowed tool.
 
     ``proxy_validated`` — when True, the spawn was routed through the subprocess
-    proxy, which already validated the command, args, arg-paths, and cwd
+    proxy, which already validated the command, args, arg-paths, cwd, and env
     (including `resolve_command` interpreter rewriting the audit layer must NOT
     re-judge). In that case only the executable-redirect check runs, since the
     proxy forwards the agent's `executable=` kwarg without inspecting it. When
     False (a captured-reference bypass, e.g. GitPython), the FULL validation
-    runs — command + args + arg-paths + cwd + executable.
+    runs — command + args + arg-paths + cwd + executable + env hard-locks.
     """
     tokens = _normalize_spawn_args(executable, raw_args)
     if not tokens:
@@ -193,7 +198,7 @@ def evaluate_spawn_command(
     _check_executable_redirect(executable, command)
 
     if proxy_validated:
-        return  # proxy already did command/args/paths/cwd validation
+        return  # proxy already did command/args/paths/cwd/env validation
 
     _name, policy = find_matching_policy(shell_policies, command)
     if policy is None:
@@ -214,6 +219,14 @@ def evaluate_spawn_command(
             f"PermissionError: arguments '{args_str}' for '{command}' rejected: "
             f"{reason} (audit policy: shell)."
         )
+
+    # Env hard-locks: for captured-reference spawns the proxy never saw, deny a
+    # locked env key set to a non-default value (e.g. an agent-poisoned
+    # GIT_SSH_COMMAND that GitPython forwards). Deny-only — the audit hook can't
+    # rewrite env — so the full inert filter stays in the proxy.
+    if env_snapshot is not None:
+        deny_patterns, _default = resolve_env_policy(env_base or {}, policy)
+        assert_env_locks(env, env_snapshot, deny_patterns)
 
     if workspace_root is not None:
         ws_path = Path(workspace_root)
@@ -258,6 +271,8 @@ def install_audit_enforcement(
     shell_policies: dict[str, dict] | None = None,
     workspace_root: str | None = None,
     workspace_module_dirs: dict[str, str] | None = None,
+    env_base: Any = None,
+    env_snapshot: dict[str, str] | None = None,
 ) -> None:
     """Install the audit-event policy engine.
 
@@ -479,6 +494,8 @@ def install_audit_enforcement(
     _shell_policies = shell_policies or {}
     _workspace_root_str = workspace_root
     _workspace_imports = workspace_module_dirs or {}
+    _env_base = env_base
+    _env_snapshot = env_snapshot
 
     def _spawn_from_subprocess_proxy() -> bool:
         """True if this spawn was routed through pyddock's subprocess proxy.
@@ -512,6 +529,7 @@ def install_audit_enforcement(
         executable = args[0] if args else None
         raw_args = args[1] if len(args) > 1 else None
         cwd = args[2] if len(args) > 2 else None
+        env = args[3] if len(args) > 3 else None
         evaluate_spawn_command(
             executable,
             raw_args,
@@ -520,6 +538,9 @@ def install_audit_enforcement(
             workspace_root=_workspace_root_str,
             workspace_module_dirs=_workspace_imports,
             proxy_validated=_spawn_from_subprocess_proxy(),
+            env=env,
+            env_base=_env_base,
+            env_snapshot=_env_snapshot,
         )
 
     def _hook(event: str, args: tuple) -> None:

@@ -94,6 +94,27 @@ class RestrictionConfig:
 
 
 @dataclass
+class EnvConfig:
+    """Global environment policy applied to every subprocess spawn.
+
+    The child's environment is always derived from a known-good snapshot
+    captured at startup; this policy governs which keys an agent may override
+    via ``env=`` (and how). Per-command ``[shell.<name>.env]`` blocks layer
+    additional locks on top of this base. See filter_child_env in
+    shell_executor for the enforcement semantics.
+    """
+
+    # Disposition for keys not matched by any deny pattern:
+    #   "inert"    — allow an override only if the value is not path/URI-like
+    #   "snapshot" — allow an override only if it equals the snapshot or is empty
+    default: str = "inert"
+    # Regex patterns (re.fullmatch against the KEY name) for keys that are
+    # hard-locked: only the snapshot value or removal (empty) is permitted,
+    # regardless of the override value.
+    deny: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ShellPolicyConfig:
     """Per-command shell execution policy.
 
@@ -105,6 +126,11 @@ class ShellPolicyConfig:
     allow: list[str] = field(default_factory=list)
     deny: list[str] = field(default_factory=list)
     arg_paths: str = "workspace"  # "workspace" | "protected" | "none"
+    # Per-command env policy (from [shell.<name>.env]): {"deny": [...],
+    # "default": "inert"|"snapshot"}. Layered on top of the global [env] base.
+    # Stored as a plain dict so the shared resolve_env_policy() can read it
+    # uniformly from both this dataclass and the serialized config dict.
+    env: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -144,6 +170,7 @@ class PyddockConfig:
     shell: dict[str, ShellPolicyConfig] = field(default_factory=dict)
     deny_messages: list[DenyMessageRule] = field(default_factory=list)
     audit: AuditConfig = field(default_factory=AuditConfig)
+    env: EnvConfig = field(default_factory=EnvConfig)
 
 
 def _parse_execution(data: dict) -> ExecutionConfig:
@@ -308,6 +335,49 @@ def _parse_restrictions(data: dict) -> dict[str, RestrictionConfig]:
     return restrictions
 
 
+_VALID_ENV_DEFAULTS = ("inert", "snapshot")
+
+
+def _validate_regexes(context: str, patterns: list[str]) -> None:
+    """Raise ConfigError if any pattern is not a valid regex."""
+    for p in patterns:
+        try:
+            re.compile(p)
+        except re.error as e:
+            raise ConfigError(f"{context} contains invalid regex '{p}': {e}")
+
+
+def _parse_env_block(section: dict, context: str) -> dict:
+    """Parse and validate an env policy block (global [env] or [shell.X.env]).
+
+    Returns a normalized dict with keys "deny" (list[str]) and, only when
+    explicitly set, "default" ("inert"|"snapshot"). Omitting "default" lets a
+    per-command block inherit the global default at resolve time.
+    """
+    if not isinstance(section, dict):
+        raise ConfigError(f"{context} must be a table")
+    deny = section.get("deny", [])
+    if not isinstance(deny, list) or not all(isinstance(s, str) for s in deny):
+        raise ConfigError(f"{context}.deny must be a list of strings")
+    _validate_regexes(f"{context}.deny", deny)
+    result: dict = {"deny": deny}
+    if "default" in section:
+        default = section["default"]
+        if default not in _VALID_ENV_DEFAULTS:
+            raise ConfigError(
+                f"{context}.default must be 'inert' or 'snapshot', got '{default}'"
+            )
+        result["default"] = default
+    return result
+
+
+def _parse_env(data: dict) -> EnvConfig:
+    """Parse the global [env] section."""
+    section = data.get("env", {})
+    block = _parse_env_block(section, "[env]")
+    return EnvConfig(default=block.get("default", "inert"), deny=block["deny"])
+
+
 def _parse_shell(data: dict) -> dict[str, ShellPolicyConfig]:
     """Parse the [shell.*] sections (table of tables)."""
     section = data.get("shell", {})
@@ -355,12 +425,18 @@ def _parse_shell(data: dict) -> dict[str, ShellPolicyConfig]:
                 f"or 'none', got '{arg_paths}'"
             )
 
+        # Optional per-command env policy: [shell.<name>.env]
+        env_policy: dict = {}
+        if "env" in value:
+            env_policy = _parse_env_block(value["env"], f"[shell.{name}.env]")
+
         shell[name] = ShellPolicyConfig(
             command=command,
             mode=mode,
             allow=allow,
             deny=deny,
             arg_paths=arg_paths,
+            env=env_policy,
         )
 
     return shell
@@ -467,6 +543,7 @@ def _parse_config(data: dict) -> PyddockConfig:
         shell=_parse_shell(data),
         deny_messages=_parse_deny_messages(data),
         audit=_parse_audit(data),
+        env=_parse_env(data),
     )
 
 

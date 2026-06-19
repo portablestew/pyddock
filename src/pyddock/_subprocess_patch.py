@@ -12,11 +12,14 @@ import sys
 from typing import Any
 
 from pyddock._base import _ORIGINALS, _find_deny_hint
+from pyddock._process_utils import make_child_env
 from pyddock.shell_executor import (
     evaluate_arg_paths,
     evaluate_arg_policy,
     evaluate_cwd,
+    filter_child_env,
     find_matching_policy,
+    resolve_env_policy,
 )
 
 
@@ -54,6 +57,14 @@ def apply_subprocess_patch(
     _resolve_cmd = resolve_command
     shell_policies = config.get("shell", {})
     _deny_msgs_sp = deny_messages
+
+    # Environment policy: the global [env] base plus a known-good snapshot of
+    # the child environment captured ONCE here, before any agent code runs.
+    # Every spawn's env is rebuilt from this snapshot (see _apply_env_policy),
+    # so agent mutations of os.environ can't reach children and PATH/loader/
+    # tool-exec vars stay pinned to their trusted values.
+    _env_base = config.get("env", {})
+    _env_snapshot = make_child_env()
 
     # Build example command for error messages
     if shell_policies:
@@ -143,6 +154,22 @@ def apply_subprocess_patch(
             ],
         )
 
+    def _apply_env_policy(policy: dict, kwargs: dict) -> None:
+        """Rebuild kwargs['env'] from the snapshot + validated agent overrides.
+
+        Always sets kwargs['env'] (even when the agent passed none) so a child
+        receives the known-good snapshot rather than inheriting the sandbox
+        process environment. Raises PermissionError if an override violates the
+        resolved [env] / [shell.<cmd>.env] policy.
+        """
+        deny_patterns, env_default = resolve_env_policy(_env_base, policy)
+        kwargs["env"] = filter_child_env(
+            kwargs.get("env"),
+            _env_snapshot,
+            deny_patterns=deny_patterns,
+            default=env_default,
+        )
+
     def _validated_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
         """subprocess.run replacement that validates against shell policies."""
         # Reject shell=True
@@ -216,11 +243,12 @@ def apply_subprocess_patch(
         # Apply interpreter mapping (same as run_shell) and execute
         resolved = _resolve_cmd(command)
         full_cmd = resolved + cmd_args
+        _apply_env_policy(policy, kwargs)
         kwargs["shell"] = False
         return _ORIGINALS["subprocess.run"](full_cmd, *args, **kwargs)
 
-    def _validate_command(cmd: Any, caller: str, cwd: Any = None) -> tuple[list[str], list[str]]:
-        """Shared validation for run() and Popen(). Returns (resolved_cmd, cmd_args).
+    def _validate_command(cmd: Any, caller: str, cwd: Any = None) -> tuple[list[str], list[str], dict]:
+        """Shared validation for run() and Popen(). Returns (resolved_cmd, cmd_args, policy).
 
         Raises PermissionError if the command is not permitted.
         """
@@ -284,7 +312,7 @@ def apply_subprocess_patch(
                 msg += f"\n[{hint}]"
             raise PermissionError(msg)
         resolved = _resolve_cmd(command)
-        return resolved + cmd_args, cmd_args
+        return resolved + cmd_args, cmd_args, policy
 
     class _SafePopen:
         """Proxy around subprocess.Popen that validates commands against shell policies.
@@ -300,7 +328,8 @@ def apply_subprocess_patch(
                     "Pass command as a list instead: "
                     f"subprocess.Popen(['{example_cmd}', 'arg1', 'arg2'])"
                 )
-            full_cmd, _ = _validate_command(cmd, "Popen", cwd=kwargs.get("cwd"))
+            full_cmd, _, policy = _validate_command(cmd, "Popen", cwd=kwargs.get("cwd"))
+            _apply_env_policy(policy, kwargs)
             kwargs["shell"] = False
             self._proc = _ORIGINALS["subprocess.Popen"](full_cmd, *args, **kwargs)
 

@@ -17,6 +17,7 @@ from typing import Any
 from pyddock._base import _ORIGINALS, _PYDDOCK_DIR, _find_deny_hint, canonical_path
 from pyddock._import_hook import _caller_is_trusted
 from pyddock._audit_enforcement import install_audit_enforcement
+from pyddock._process_utils import make_child_env
 
 
 def apply_filesystem_scoping(
@@ -656,4 +657,6 @@ def apply_filesystem_scoping(
         shell_policies=config.get("shell", {}),
         workspace_root=str(workspace_root),
         workspace_module_dirs=config.get("imports", {}).get("workspace", {}),
+        env_base=config.get("env", {}),
+        env_snapshot=make_child_env(),
     )

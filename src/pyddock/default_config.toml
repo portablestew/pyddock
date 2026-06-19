@@ -355,6 +355,18 @@ allow = [
     "fetch(\\s|$)", "pull(\\s|$)",
 ]
 
+# git honors many env vars that lead to command execution or out-of-tree access.
+# These are the env-side equivalents of the [shell.git] -c / transport denials.
+[shell.git.env]
+deny = [
+    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND",  # arbitrary command on transport
+    "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR",     # arbitrary command on diff/page/edit
+    "GIT_CONFIG.*",                                     # incl. GIT_CONFIG_COUNT/KEY_n/VALUE_n injection
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",       # redirect repo/index out of tree
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_TRACE.*",                                      # GIT_TRACE=<path> → arbitrary file write
+]
+
 [shell.p4]
 mode = "deny"
 # Verbs anchored with (\s|$) for the same reason as [shell.git]: a short verb
@@ -376,6 +388,9 @@ allow = [
     # Changelist management (not submit)
     "change(\\s|$)",
 ]
+
+[shell.p4.env]
+deny = ["P4PORT", "P4CONFIG", "P4DIFF", "P4MERGE", "P4EDITOR"]
 
 [shell.docker]
 # Compose-only policy: scoped to the workspace's docker-compose.yml.
@@ -399,6 +414,9 @@ allow = [
     "system df(\\s|$)", "version(\\s|$)", "info(\\s|$)",
 ]
 
+[shell.docker.env]
+deny = ["DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT"]
+
 # Path-like command patterns trigger automatic write protection — run_python cannot
 # write to directories matching these patterns, preventing write-then-execute escalation.
 # Script interpreter mapping is automatic: .ps1→powershell, .py→python, .sh→bash, .bat→cmd /c.
@@ -407,6 +425,46 @@ allow = [
 #mode = "allow"
 #deny = []
 #arg_paths = "workspace"
+
+# Environment policy for subprocess spawns (run_shell + subprocess.* in run_python).
+#
+# The child's environment is always derived from a known-good SNAPSHOT captured
+# at startup. Agent-supplied env= is treated as OVERRIDES on that snapshot —
+# never a replacement — so a child always keeps the trusted base. Per key, an
+# override is permitted only if it is one of:
+#   * equal to the snapshot value (a no-op),
+#   * empty  (explicit removal of the var), or
+#   * permitted by the policy below.
+#
+# [env] is the GLOBAL base, applied to every spawn (loader/resolution vars that
+# are dangerous regardless of command). The per-command [shell.<cmd>.env] blocks
+# (defined under each command's section above) add command-specific locks on
+# top. Deny always wins (global deny ∪ command deny).
+#
+# default — disposition for keys NOT matched by any deny pattern:
+#   "inert"    — allow an override only if the value is not path-like or URI-like
+#                (cheap, deterministic; no `which`, no filesystem access). This is
+#                the coverage net for vars we didn't enumerate: an unknown var
+#                can't carry a path/URI payload that redirects a tool.
+#   "snapshot" — allow an override only if it equals the snapshot value or is empty.
+# deny — regex patterns (re.fullmatch against the KEY name) for keys hard-locked
+#        to snapshot-or-empty regardless of the value. Use for keys interpreted
+#        as code/config/loader BY DESIGN, where value inspection is blind (a bare
+#        command name like GIT_SSH_COMMAND=calc is not path-like, so only a lock
+#        is sound). The proxy enforces the full policy and rewrites env; the audit
+#        layer (captured-reference spawns like GitPython) enforces these locks only.
+[env]
+default = "inert"
+deny = [
+    "PATH", "PATHEXT",            # command resolution hijack
+    "LD_.*", "DYLD_.*",           # ELF / Mach-O loader injection (LD_PRELOAD, ...)
+    "PSModulePath",               # PowerShell module hijack (.ps1 mapping)
+    "PYTHON.*",                   # python mapping (.py) — startup/home/path
+    "TMPDIR", "TEMP", "TMP",      # scratch-file redirection
+    "COMSPEC",                    # cmd /c mapping (.bat)
+    "BASH_ENV", "ENV", "BASH_FUNC_.*", "PROMPT_COMMAND",  # shell startup exec
+    "EDITOR", "VISUAL", "PAGER",  # generic external-command hooks
+]
 
 # Custom denial hints — appended to rejection messages when the pattern matches
 # the attempted action. These do NOT define new deny rules; they only provide

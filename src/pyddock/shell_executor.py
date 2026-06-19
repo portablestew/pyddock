@@ -159,6 +159,193 @@ def evaluate_arg_policy(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Environment-variable policy for subprocess spawns
+# ---------------------------------------------------------------------------
+#
+# The child's environment is always derived from a known-good SNAPSHOT captured
+# at startup (before agent code runs). Agent-supplied `env=` is treated as a set
+# of OVERRIDES layered on that snapshot — never a wholesale replacement — so a
+# child always keeps the trusted base.
+#
+# These primitives are the single source of truth shared by the two enforcement
+# sites that can see an agent-controlled env: the subprocess proxy
+# (_subprocess_patch, which rewrites env via filter_child_env) and the audit
+# shell disposition (_audit_enforcement, which can only deny, via
+# assert_env_locks, for captured-reference spawns like GitPython).
+
+# A scheme://… URI prefix (tcp://, http://, ssh://, …). Distinct from a Windows
+# drive (C:\) which is caught by the separator/drive checks below.
+_ENV_URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
+def is_unsafe_env_value(value: str) -> bool:
+    """True if an env value looks like a filesystem path or a URI.
+
+    Tuned for ENV VALUES, deliberately NOT reusing `_looks_like_path` (which is
+    for shell *args* and excludes `//…` as Perforce/UNC). For an env value,
+    `\\\\server\\share` and `scheme://host` are exactly the dangerous redirects
+    we want to catch. False positives are acceptable (the agent merely can't set
+    that var to a path); false negatives for the path/URI class are the only real
+    risk. No filesystem access and no `which` — this is the cheap, deterministic
+    half of the value filter; command-execution vars are covered by the per-
+    command hard-locks instead.
+    """
+    if not value:
+        return False
+    if "/" in value or "\\" in value:        # separators, incl. UNC \\server
+        return True
+    if value[0] in ".~":                      # ./  ../  ~  (relative / home)
+        return True
+    if len(value) >= 2 and value[1] == ":" and value[0].isalpha():
+        return True                           # C:\...  drive-qualified
+    if _ENV_URI_RE.match(value):              # tcp://  http://  ssh://  ...
+        return True
+    return False
+
+
+def _coerce_env_item(raw_key: Any, raw_value: Any) -> tuple[str, str]:
+    """Normalize an env (key, value) pair to text (handles bytes / None)."""
+    key = (
+        raw_key.decode("utf-8", "surrogateescape")
+        if isinstance(raw_key, bytes)
+        else str(raw_key)
+    )
+    if raw_value is None:
+        value = ""
+    elif isinstance(raw_value, bytes):
+        value = raw_value.decode("utf-8", "surrogateescape")
+    else:
+        value = str(raw_value)
+    return key, value
+
+
+def _env_key_locked(key: str, deny_patterns: list[str]) -> bool:
+    """True if `key` matches (full-match) any hard-lock deny pattern."""
+    return any(re.fullmatch(p, key) for p in deny_patterns)
+
+
+def _policy_env(policy: Any) -> dict | None:
+    """Read a policy's per-command env block from dict or dataclass form."""
+    if policy is None:
+        return None
+    if isinstance(policy, dict):
+        return policy.get("env") or None
+    return getattr(policy, "env", None) or None
+
+
+def resolve_env_policy(global_env: Any, command_policy: Any) -> tuple[list[str], str]:
+    """Merge the global [env] base with a per-command env block.
+
+    Returns (deny_patterns, default). Deny always wins: the command's deny
+    patterns are appended to the global ones. The command may override the
+    global default disposition. Accepts both the serialized dict form (proxy /
+    audit) and the EnvConfig/ShellPolicyConfig dataclass form (callers may pass
+    either) so the two enforcement sites cannot drift.
+    """
+    if isinstance(global_env, dict):
+        deny = list(global_env.get("deny", []))
+        default = global_env.get("default", "inert")
+    elif global_env is None:
+        deny, default = [], "inert"
+    else:  # EnvConfig dataclass
+        deny = list(getattr(global_env, "deny", []))
+        default = getattr(global_env, "default", "inert")
+    cmd_env = _policy_env(command_policy)
+    if cmd_env:
+        deny = deny + list(cmd_env.get("deny", []))
+        default = cmd_env.get("default", default)
+    return deny, default
+
+
+def filter_child_env(
+    agent_env: Any,
+    snapshot: dict[str, str],
+    *,
+    deny_patterns: list[str],
+    default: str,
+) -> dict[str, str]:
+    """Return the env a child may receive, or raise PermissionError.
+
+    Baseline is the snapshot. Each agent-supplied entry is an override:
+      * value == snapshot[key]   → allowed (no-op)
+      * value == ""              → allowed (explicit removal of the var)
+      * key locked (deny match)  → rejected (only snapshot/empty allowed above)
+      * default == "snapshot"    → rejected (only snapshot/empty permitted)
+      * default == "inert"       → allowed iff the value is not path/URI-like
+
+    Keys the agent does not mention keep their snapshot value. Used by the
+    subprocess proxy, which both rewrites (the returned dict) and rejects.
+    """
+    effective = dict(snapshot)
+    if not agent_env:
+        return effective
+    items = agent_env.items() if hasattr(agent_env, "items") else agent_env
+    for raw_key, raw_value in items:
+        key, value = _coerce_env_item(raw_key, raw_value)
+        snap_value = snapshot.get(key)
+        if snap_value is not None and value == snap_value:
+            continue  # unchanged from the known-good value
+        if value == "":
+            effective.pop(key, None)  # explicit removal
+            continue
+        if _env_key_locked(key, deny_patterns):
+            raise PermissionError(
+                f"PermissionError: environment variable {key!r} is locked to its "
+                f"known-good value for this command and cannot be overridden "
+                f"(env policy)."
+            )
+        if default == "snapshot":
+            raise PermissionError(
+                f"PermissionError: environment variable {key!r} cannot be "
+                f"overridden (env policy: snapshot — only the known-good value or "
+                f"removal is permitted)."
+            )
+        if is_unsafe_env_value(value):
+            raise PermissionError(
+                f"PermissionError: refusing environment override {key}={value!r} — "
+                f"the value looks like a path or URI, which can redirect a tool to "
+                f"attacker-controlled code or locations (env policy: inert)."
+            )
+        effective[key] = value
+    return effective
+
+
+def assert_env_locks(
+    agent_env: Any,
+    snapshot: dict[str, str],
+    deny_patterns: list[str],
+) -> None:
+    """Audit-layer backstop: reject a LOCKED key set to a non-default value.
+
+    Unlike filter_child_env (the proxy: rewrites + full inert filter), the audit
+    hook cannot mutate the env it observes, so it enforces only the non-
+    negotiable hard-locks — the keys whose values cause code execution / library
+    loading. The inert-default filtering of unknown keys is a proxy-only
+    convenience (it needs the snapshot merge that only the proxy can perform).
+    This keeps the backstop from false-positiving on benign inert vars that a
+    captured-reference spawn (e.g. GitPython) forwards from the environment.
+
+    Raises PermissionError on the first violating locked key; returns None
+    otherwise (including when agent_env is None — an env=None spawn inherits the
+    process environment, which the audit hook cannot rewrite; keeping
+    os.putenv/os.unsetenv denied is the defense-in-depth for that path).
+    """
+    if not agent_env:
+        return
+    items = agent_env.items() if hasattr(agent_env, "items") else agent_env
+    for raw_key, raw_value in items:
+        key, value = _coerce_env_item(raw_key, raw_value)
+        if not _env_key_locked(key, deny_patterns):
+            continue
+        if value == "" or value == snapshot.get(key):
+            continue
+        raise PermissionError(
+            f"PermissionError: environment variable {key!r} is locked and cannot "
+            f"be set to a non-default value for this command (audit policy: env)."
+        )
+
+
 def find_matching_policy(
     shell_policies: dict[str, Any], command: str
 ) -> tuple[str | None, Any | None]:

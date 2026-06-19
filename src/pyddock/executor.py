@@ -267,6 +267,7 @@ class SubprocessExecutor:
                     "allow": s.allow,
                     "deny": s.deny,
                     "arg_paths": s.arg_paths,
+                    "env": s.env,
                 }
                 for name, s in self._config.shell.items()
             },
@@ -278,6 +279,10 @@ class SubprocessExecutor:
                 {"pattern": p, "disposition": d}
                 for p, d in self._config.audit.rules
             ],
+            "env": {
+                "default": self._config.env.default,
+                "deny": self._config.env.deny,
+            },
         }
 
     @staticmethod
