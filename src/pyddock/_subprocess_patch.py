@@ -8,12 +8,16 @@ shell policies, and blocks os.system().
 from __future__ import annotations
 
 import pathlib
-import re
 import sys
 from typing import Any
 
-from pyddock._base import _ORIGINALS, _find_deny_hint, canonical_path
-from pyddock.shell_executor import evaluate_arg_policy, evaluate_arg_paths
+from pyddock._base import _ORIGINALS, _find_deny_hint
+from pyddock.shell_executor import (
+    evaluate_arg_paths,
+    evaluate_arg_policy,
+    evaluate_cwd,
+    find_matching_policy,
+)
 
 
 def apply_subprocess_patch(
@@ -64,11 +68,13 @@ def apply_subprocess_patch(
         allowed_commands_str = "(none configured)"
 
     def _find_matching_policy(command: str) -> dict | None:
-        """Find first matching shell policy for a command."""
-        for _name, policy in shell_policies.items():
-            if re.match(policy["command"], command):
-                return policy
-        return None
+        """Find first matching shell policy for a command.
+
+        Delegates to the shared find_matching_policy() so the proxy, run_shell,
+        and the audit shell disposition use one command->policy lookup.
+        """
+        _name, policy = find_matching_policy(shell_policies, command)
+        return policy
 
     def _check_args_policy(policy: dict, cmd_args: list[str]) -> str | None:
         """Validate args against policy. Returns error message or None.
@@ -94,34 +100,12 @@ def apply_subprocess_patch(
             f"Arguments '{args_str}' not permitted. Allowed patterns: {allowed}"
         )
 
-    # Pre-compute protected paths for arg scanning.
-    # canonical_path (realpath) resolves 8.3 short names / symlinks / junctions /
-    # subst drives so cwd containment checks cannot be bypassed by aliasing — the
-    # same hardening applied in _fs_enforcement and shell_executor.
+    # Workspace context for the shared arg-path / cwd scanners. Path resolution
+    # and protected-dir derivation live in shell_executor (evaluate_arg_paths /
+    # evaluate_cwd), so this site stays in lockstep with the audit-layer shell
+    # disposition and cannot drift.
     _ws_root = workspace_root
-    _pyddock_dir = canonical_path(_ws_root / ".pyddock")
     _workspace_imports = config.get("imports", {}).get("workspace", {})
-    _ws_module_dirs: list[tuple[str, pathlib.Path]] = [
-        (mod_name, canonical_path(_ws_root / rel_path))
-        for mod_name, rel_path in _workspace_imports.items()
-    ]
-    _shell_protected_dirs: list[tuple[str, pathlib.Path]] = []
-    for _sp_name, _sp_policy in shell_policies.items():
-        _sp_cmd = _sp_policy.get("command", "")
-        if "/" in _sp_cmd or "\\\\" in _sp_cmd or _sp_cmd.startswith("\\."):
-            _sp_pattern = _sp_cmd.lstrip("^").rstrip("$")
-            if "/" in _sp_pattern:
-                _sp_dir = _sp_pattern.rsplit("/", 1)[0]
-            elif "\\\\" in _sp_pattern:
-                _sp_dir = _sp_pattern.rsplit("\\\\", 1)[0]
-            else:
-                _sp_dir = _sp_pattern
-            if _sp_dir:
-                _sp_clean = _sp_dir.replace("\\.", ".").replace("\\/", "/")
-                _shell_protected_dirs.append(
-                    (_sp_clean, canonical_path(_ws_root / _sp_clean))
-                )
-    _ws_root_abs = canonical_path(_ws_root)
 
     _looks_like_path_rt = looks_like_path
     _extract_path_candidates_rt = extract_path_candidates
@@ -130,7 +114,7 @@ def apply_subprocess_patch(
         """Scan args for path-like values and validate against arg_paths policy.
 
         Thin wrapper over the shared evaluate_arg_paths() so subprocess.run stays
-        in lockstep with run_shell (ShellExecutor) and the GitPython guard.
+        in lockstep with run_shell (ShellExecutor) and the audit shell disposition.
         """
         return evaluate_arg_paths(
             cmd_args,
@@ -143,72 +127,21 @@ def apply_subprocess_patch(
         )
 
     def _check_cwd(policy: dict, cwd: Any) -> str | None:
-        """Validate cwd kwarg against the same rules as arg paths.
+        """Validate cwd against the policy's arg_paths mode.
 
-        Applies the policy's arg_paths mode to the cwd directory:
-        - "none": no restriction
-        - "protected": block cwd inside protected directories
-        - "workspace": block cwd outside the workspace or inside protected dirs
-
-        Returns None if cwd is permitted, or an error message string if blocked.
+        Thin wrapper over the shared evaluate_cwd() so subprocess.run stays in
+        lockstep with the audit-layer shell disposition. Returns None if cwd is
+        permitted, or an error message string if blocked.
         """
-        if cwd is None:
-            return None
-
-        arg_paths_mode = policy.get("arg_paths", "workspace")
-        if arg_paths_mode == "none":
-            return None
-
-        resolved = canonical_path(cwd)
-
-        # Check .pyddock/ (excluding .pyddock/tmp/)
-        try:
-            rel = resolved.relative_to(_pyddock_dir)
-            if not str(rel).startswith("tmp"):
-                return (
-                    f"cwd '{cwd}' targets the protected .pyddock/ directory. "
-                    f"Subprocess cwd cannot be set to .pyddock/ "
-                    f"(self-modification protection)."
-                )
-        except ValueError:
-            pass
-
-        # Check workspace module directories
-        for mod_name, ws_dir in _ws_module_dirs:
-            try:
-                resolved.relative_to(ws_dir)
-                return (
-                    f"cwd '{cwd}' targets workspace module directory "
-                    f"'{mod_name}'. Subprocess cwd cannot be set to workspace "
-                    f"module directories."
-                )
-            except ValueError:
-                continue
-
-        # Check shell script directories
-        for dir_label, script_dir in _shell_protected_dirs:
-            try:
-                resolved.relative_to(script_dir)
-                return (
-                    f"cwd '{cwd}' targets a shell-executable script "
-                    f"directory ({dir_label}). Subprocess cwd cannot be set "
-                    f"to script directories (write-then-execute prevention)."
-                )
-            except ValueError:
-                continue
-
-        # "workspace" mode: block cwd outside the workspace
-        if arg_paths_mode == "workspace":
-            try:
-                resolved.relative_to(_ws_root_abs)
-            except ValueError:
-                return (
-                    f"cwd '{cwd}' resolves to '{resolved}' which is outside "
-                    f"the workspace. Subprocess cwd is restricted to the "
-                    f"workspace directory (arg_paths = \"workspace\")."
-                )
-
-        return None
+        return evaluate_cwd(
+            cwd,
+            arg_paths=policy.get("arg_paths", "workspace"),
+            workspace_root=_ws_root,
+            workspace_module_dirs=_workspace_imports,
+            shell_command_patterns=[
+                p.get("command", "") for p in shell_policies.values()
+            ],
+        )
 
     def _validated_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
         """subprocess.run replacement that validates against shell policies."""

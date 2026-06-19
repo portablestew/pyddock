@@ -33,6 +33,7 @@ from pyddock.config import (
     FilesystemConfig,
     ImportsConfig,
     PyddockConfig,
+    ShellPolicyConfig,
 )
 from pyddock.executor import SubprocessExecutor
 from pyddock.venv_manager import VenvManager
@@ -322,6 +323,13 @@ class TestDefaultConfigShipsProtections:
         assert any(d == "agent-deny" for d in rules.values()), rules
         assert rules.get("ctypes.*") == "agent-deny"
         assert any(d == "network" for d in rules.values()), rules
+        # shell disposition for subprocess spawn
+        assert rules.get("subprocess.Popen") == "shell"
+        # os.exec/system/spawn are agent-deny (defense-in-depth)
+        assert rules.get("os.exec") == "agent-deny"
+        assert rules.get("os.system") == "agent-deny"
+        assert rules.get("os.posix_spawn") == "agent-deny"
+        assert rules.get("os.spawn") == "agent-deny"
 
     def test_empty_audit_means_no_audit_hook(self, venv_manager, workspace) -> None:
         # With [audit] empty and debug off, the audit hook isn't installed, so the
@@ -456,3 +464,292 @@ class TestAllowDispositionSilent:
         events = {r["event"] for r in self._read_log(workspace)}
         assert "os.listdir" in events, events          # observe -> logged
         assert "os.scandir" not in events, events      # allow -> silent
+
+
+# ---------------------------------------------------------------------------
+# Shell disposition: subprocess.Popen validated against [shell.*] at audit layer
+# ---------------------------------------------------------------------------
+
+
+GIT_POLICY = {
+    "command": "^git$",
+    "mode": "deny",
+    "allow": ["status(\\s|$)", "log(\\s|$)", "fetch(\\s|$)", "add(\\s|$)"],
+    "deny": ["ext::", "--upload-pack", "--receive-pack"],
+    "arg_paths": "workspace",
+}
+
+
+class TestEvaluateSpawnCommand:
+    """Direct unit tests of the audit-layer shell validator.
+
+    `evaluate_spawn_command` is the logic the `shell` disposition runs for the
+    `subprocess.Popen` audit event. It is the authoritative backstop for spawns
+    that bypass the subprocess proxy (a captured `from subprocess import Popen`
+    reference, as GitPython does). Tested directly because, by design, the hook
+    skips spawns routed through the proxy, so an end-to-end run exercises the
+    proxy rather than this code.
+
+    Both platform event shapes are covered: POSIX passes argv as a LIST; Windows
+    passes a list2cmdline STRING.
+    """
+
+    @staticmethod
+    def _ev(executable, raw_args, **kw):
+        from pyddock._audit_enforcement import evaluate_spawn_command
+        return evaluate_spawn_command(executable, raw_args, **kw)
+
+    @staticmethod
+    def _shell():
+        return {"git": dict(GIT_POLICY)}
+
+    # --- POSIX shape (list) ---
+    def test_posix_allowed(self) -> None:
+        self._ev("git", ["git", "status", "--short"], shell_policies=self._shell())
+
+    def test_posix_denied_subcommand(self) -> None:
+        with pytest.raises(PermissionError, match="allow-list"):
+            self._ev("git", ["git", "push", "origin"], shell_policies=self._shell())
+
+    def test_posix_deny_pattern_wins(self) -> None:
+        with pytest.raises(PermissionError, match="deny pattern"):
+            self._ev("git", ["git", "fetch", "ext::sh -c evil"], shell_policies=self._shell())
+
+    # --- Windows shape (list2cmdline string) ---
+    def test_windows_allowed(self) -> None:
+        self._ev(None, "git status --short", shell_policies=self._shell())
+
+    def test_windows_denied_subcommand(self) -> None:
+        with pytest.raises(PermissionError, match="allow-list"):
+            self._ev(None, "git push origin", shell_policies=self._shell())
+
+    def test_windows_deny_pattern_in_quoted_value(self) -> None:
+        # list2cmdline quotes the arg with spaces; the deny token must still be
+        # found inside the quoted value (re.search), and quotes are stripped.
+        import subprocess
+        cmdline = subprocess.list2cmdline(["git", "fetch", "ext::sh -c evil"])
+        with pytest.raises(PermissionError, match="deny pattern"):
+            self._ev(None, cmdline, shell_policies=self._shell())
+
+    # --- command identification / spoofing ---
+    def test_unknown_command_denied(self) -> None:
+        with pytest.raises(PermissionError, match="no matching shell policy"):
+            self._ev("curl", ["curl", "http://evil"], shell_policies=self._shell())
+
+    def test_planted_path_executable_cannot_impersonate_git(self) -> None:
+        # The spoof: an agent-written workspace/hax/git.exe. The FULL token is
+        # matched against ^git$ (never a basename), so a path cannot match.
+        with pytest.raises(PermissionError, match="no matching shell policy"):
+            self._ev(
+                "workspace/hax/git.exe",
+                ["workspace/hax/git.exe", "status"],
+                shell_policies=self._shell(),
+            )
+
+    def test_windows_planted_path_executable_denied(self) -> None:
+        with pytest.raises(PermissionError, match="no matching shell policy"):
+            self._ev(None, r'"C:\hax\git.exe" status', shell_policies=self._shell())
+
+    def test_absolute_path_to_real_git_denied_like_proxy(self) -> None:
+        # Consistent with the proxy: an absolute path doesn't match ^git$.
+        with pytest.raises(PermissionError, match="no matching shell policy"):
+            self._ev(None, r'"C:\Program Files\Git\cmd\git.exe" status',
+                     shell_policies=self._shell())
+
+    # --- executable= redirect spoof ---
+    def test_executable_redirect_spoof_denied(self) -> None:
+        # argv[0]='git' (allowed) but executable points at a planted binary.
+        with pytest.raises(PermissionError, match="does not match"):
+            self._ev(
+                "workspace/hax/evil.exe",
+                ["git", "status"],
+                shell_policies=self._shell(),
+            )
+
+    def test_executable_redirect_spoof_denied_windows_shape(self) -> None:
+        with pytest.raises(PermissionError, match="does not match"):
+            self._ev(r"C:\hax\evil.exe", "git status", shell_policies=self._shell())
+
+    def test_executable_equal_to_argv0_allowed(self) -> None:
+        # POSIX defaults executable to argv[0]; an equal value is the normal case.
+        self._ev("git", ["git", "status"], shell_policies=self._shell())
+
+    def test_executable_bytes_equal_to_argv0_allowed(self) -> None:
+        # bytes executable matching bytes argv[0] (both decode to 'git').
+        self._ev(b"git", [b"git", b"status"], shell_policies=self._shell())
+
+    def test_honest_full_path_executable_denied_failclosed(self) -> None:
+        # Documented trade-off: an honest full-path executable with a bare argv[0]
+        # is denied (fail-closed). No PATH resolution is performed.
+        with pytest.raises(PermissionError, match="does not match"):
+            self._ev(
+                "/usr/bin/git", ["git", "status"], shell_policies=self._shell()
+            )
+
+    # --- shell=True forms are denied because cmd/sh isn't an allowed command ---
+    def test_windows_shell_true_form_denied(self) -> None:
+        with pytest.raises(PermissionError, match="no matching shell policy"):
+            self._ev(None, r'C:\WINDOWS\system32\cmd.exe /c "git status"',
+                     shell_policies=self._shell())
+
+    def test_posix_shell_true_form_denied(self) -> None:
+        with pytest.raises(PermissionError, match="no matching shell policy"):
+            self._ev("/bin/sh", ["/bin/sh", "-c", "git status"], shell_policies=self._shell())
+
+    # --- arg_paths scanning (parity with the proxy) ---
+    def test_arg_paths_blocks_pyddock_write(self, tmp_path) -> None:
+        with pytest.raises(PermissionError, match=r"\.pyddock"):
+            self._ev(
+                "git", ["git", "add", ".pyddock/pwned.txt"],
+                shell_policies=self._shell(),
+                workspace_root=str(tmp_path),
+            )
+
+    def test_arg_paths_blocks_outside_workspace(self, tmp_path) -> None:
+        with pytest.raises(PermissionError, match="outside"):
+            self._ev(
+                "git", ["git", "add", "../../etc/passwd"],
+                shell_policies=self._shell(),
+                workspace_root=str(tmp_path),
+            )
+
+    def test_arg_paths_allows_workspace_relative(self, tmp_path) -> None:
+        self._ev(
+            "git", ["git", "add", "output/result.txt"],
+            shell_policies=self._shell(),
+            workspace_root=str(tmp_path),
+        )
+
+    def test_arg_paths_skipped_without_workspace_root(self) -> None:
+        # No workspace_root -> path scan disabled (back-compat for unit use).
+        self._ev("git", ["git", "add", ".pyddock/whatever.txt"], shell_policies=self._shell())
+
+    # --- cwd scanning (parity with the proxy; covers the bypass path) ---
+    def test_cwd_blocks_pyddock(self, tmp_path) -> None:
+        with pytest.raises(PermissionError, match=r"\.pyddock"):
+            self._ev(
+                "git", ["git", "status"], cwd=".pyddock",
+                shell_policies=self._shell(), workspace_root=str(tmp_path),
+            )
+
+    def test_cwd_blocks_outside_workspace(self, tmp_path) -> None:
+        with pytest.raises(PermissionError, match="outside"):
+            self._ev(
+                "git", ["git", "status"], cwd="../../somewhere",
+                shell_policies=self._shell(), workspace_root=str(tmp_path),
+            )
+
+    def test_cwd_allows_workspace_subdir(self, tmp_path) -> None:
+        self._ev(
+            "git", ["git", "status"], cwd="subdir",
+            shell_policies=self._shell(), workspace_root=str(tmp_path),
+        )
+
+    def test_cwd_none_allowed(self, tmp_path) -> None:
+        self._ev(
+            "git", ["git", "status"], cwd=None,
+            shell_policies=self._shell(), workspace_root=str(tmp_path),
+        )
+
+    # --- proxy_validated: only the executable-redirect check runs ---
+    def test_proxy_validated_skips_policy(self) -> None:
+        # A subcommand the policy would reject is allowed through when the proxy
+        # already validated it (the proxy handles resolve_command rewriting).
+        self._ev("pwsh", ["pwsh", "-File", "x.ps1"], shell_policies=self._shell(),
+                 proxy_validated=True)
+
+    def test_proxy_validated_still_blocks_executable_redirect(self) -> None:
+        # The executable= spoof is the one thing the proxy doesn't check, so the
+        # audit layer enforces it even for proxy-routed spawns.
+        with pytest.raises(PermissionError, match="does not match"):
+            self._ev("workspace/hax/evil.exe", ["git", "status"],
+                     shell_policies=self._shell(), proxy_validated=True)
+
+    def test_proxy_validated_normal_spawn_allowed(self) -> None:
+        # Normal proxy spawn (executable defaults to argv[0]) passes.
+        self._ev("git", ["git", "push", "origin"], shell_policies=self._shell(),
+                 proxy_validated=True)
+
+    # --- malformed / empty ---
+    def test_empty_args_is_noop(self) -> None:
+        self._ev(None, [], shell_policies=self._shell())  # nothing runnable
+        self._ev(None, "", shell_policies=self._shell())
+
+
+class TestShellDispositionIntegration:
+    """End-to-end: a config with `subprocess.Popen = shell` enforces policy.
+
+    These go through the subprocess proxy (the audit hook skips proxy-routed
+    spawns), so they confirm the integrated config is wired correctly and a
+    denied command never spawns a process.
+    """
+
+    @pytest.fixture
+    def shell_executor(self, venv_manager) -> SubprocessExecutor:
+        cfg = PyddockConfig(
+            execution=ExecutionConfig(timeout=30.0),
+            imports=ImportsConfig(allowed=["os", "sys", "subprocess"]),
+            filesystem=FilesystemConfig(writable_paths=["."], readable_paths=["*"]),
+            ast=ASTConfig(
+                block_calls=["eval", "exec", "compile", "breakpoint", "__import__"],
+                block_attributes=list(DEFAULT_BLOCK_ATTRS),
+            ),
+            restrictions={},
+            shell={"git": ShellPolicyConfig(
+                command="^git$",
+                mode="deny",
+                allow=["status(\\s|$)", "log(\\s|$)", "fetch(\\s|$)"],
+                deny=["ext::", "--upload-pack", "--receive-pack"],
+            )},
+            audit=AuditConfig(rules=[("open", "fs"), ("subprocess.Popen", "shell")]),
+        )
+        return SubprocessExecutor(cfg, venv_manager)
+
+    def test_denied_command_blocked(self, shell_executor, workspace) -> None:
+        src = (
+            "import subprocess\n"
+            "try:\n"
+            "    subprocess.run(['git', 'push', 'origin'])\n"
+            "    print('SHOULD NOT REACH')\n"
+            "except PermissionError as e:\n"
+            "    print(f'BLOCKED: {e}')\n"
+        )
+        result = _run(shell_executor, workspace, src)
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED" in result.stdout
+
+    def test_deny_pattern_wins(self, shell_executor, workspace) -> None:
+        src = (
+            "import subprocess\n"
+            "try:\n"
+            "    subprocess.run(['git', 'fetch', 'ext::sh -c evil'])\n"
+            "    print('SHOULD NOT REACH')\n"
+            "except PermissionError as e:\n"
+            "    print(f'BLOCKED: {e}')\n"
+        )
+        result = _run(shell_executor, workspace, src)
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED" in result.stdout
+        assert "deny pattern" in result.stdout
+
+    def test_executable_redirect_blocked_through_proxy(self, shell_executor, workspace) -> None:
+        # The proxy validates argv[0]='git' and forwards executable= without
+        # inspecting it; the audit layer enforces the executable-redirect check
+        # even for proxy-routed spawns. Before the fix this produced a
+        # FileNotFoundError (the redirect was attempted); now it's blocked.
+        src = (
+            "import subprocess\n"
+            "try:\n"
+            "    subprocess.run(['git', 'status'], executable='zzz_marker', capture_output=True)\n"
+            "    print('NOT BLOCKED')\n"
+            "except PermissionError as e:\n"
+            "    print('BLOCKED:', e)\n"
+            "except FileNotFoundError:\n"
+            "    print('REDIRECT ATTEMPTED')\n"
+        )
+        result = _run(shell_executor, workspace, src)
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED" in result.stdout
+        assert "does not match" in result.stdout
+        assert "audit policy: shell" in result.stdout
+

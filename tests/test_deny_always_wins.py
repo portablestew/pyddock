@@ -1,15 +1,16 @@
 """Tests for the shared "deny always wins" shell-policy matching.
 
 The allow/deny decision is centralized in shell_executor (args_match_deny /
-args_match_allow / evaluate_arg_policy) and reused by all three enforcement
-sites: run_shell (ShellExecutor), subprocess.run inside run_python
-(_subprocess_patch), and the GitPython guard (_gitpython_patch).
+args_match_allow / evaluate_arg_policy) and reused by all enforcement sites:
+run_shell (ShellExecutor), subprocess.run inside run_python
+(_subprocess_patch), and the audit-layer shell disposition
+(_audit_enforcement).
 
 Key invariants under test:
   - deny is checked first, in BOTH modes (deny wins over allow)
   - deny uses re.search (matches a token anywhere, incl. after a newline)
   - allow uses re.match (start-anchored to the leading verb)
-  - the three sites agree (the git RCE token `ext::` is blocked on each)
+  - the enforcement sites agree (the git RCE token `ext::` is blocked on each)
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ from pyddock.shell_executor import (
     args_match_deny,
     evaluate_arg_policy,
 )
-from pyddock._gitpython_patch import build_git_command_validator
 from pyddock.venv_manager import VenvManager
 
 
@@ -202,38 +202,3 @@ class TestSubprocessPath:
         assert result.exit_code == 0, result.stderr
         assert "BLOCKED" in result.stdout
         assert "deny pattern" in result.stdout
-
-
-# ---------------------------------------------------------------------------
-# Site 3: GitPython guard
-# ---------------------------------------------------------------------------
-
-
-class TestGitPythonGuardDeny:
-    @pytest.fixture
-    def validate(self):
-        config = {
-            "imports": {"allowed": ["git"]},
-            "shell": {
-                "git": {
-                    "mode": "deny",
-                    "allow": ["fetch.*", "status.*", "ls-remote.*"],
-                    "deny": ["ext::", "--upload-pack", "--receive-pack"],
-                }
-            },
-        }
-        return build_git_command_validator(config, deny_messages=[])
-
-    @pytest.mark.parametrize("command", [
-        pytest.param(["git", "fetch", "ext::sh -c evil"], id="fetch_ext"),
-        pytest.param(["git", "ls-remote", "ext::sh -c evil"], id="ls_remote_ext"),
-        pytest.param(["git", "fetch", "--upload-pack=/bin/sh", "origin"], id="upload_pack"),
-        pytest.param(["git", "fetch", "--receive-pack=/bin/sh", "origin"], id="receive_pack"),
-        pytest.param(["git", "pull", "ext::sh -c evil"], id="pull_ext"),
-    ])
-    def test_dangerous_tokens_denied(self, validate, command) -> None:
-        with pytest.raises(PermissionError):
-            validate(command)
-
-    def test_plain_fetch_allowed(self, validate) -> None:
-        validate(["git", "fetch", "origin"])  # should not raise

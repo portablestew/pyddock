@@ -56,11 +56,19 @@ event, cannot recurse) and never raise.
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from pyddock._base import SNIPPET_FILENAME
+from pyddock.shell_executor import (
+    evaluate_arg_paths,
+    evaluate_arg_policy,
+    evaluate_cwd,
+    find_matching_policy,
+)
 
 # Real C builtin, captured before the sys proxy is installed.
 _REAL_GETFRAME = sys._getframe
@@ -68,8 +76,172 @@ _REAL_GETFRAME = sys._getframe
 # Disposition vocabulary.
 _FS_DISPOSITIONS = frozenset({"fs", "fs-write", "fs-write-pair"})
 _DENY_DISPOSITIONS = frozenset({"agent-deny", "network"})
-_ENFORCING = _FS_DISPOSITIONS | _DENY_DISPOSITIONS
+_SHELL_DISPOSITIONS = frozenset({"shell"})
+_ENFORCING = _FS_DISPOSITIONS | _DENY_DISPOSITIONS | _SHELL_DISPOSITIONS
 VALID_DISPOSITIONS = _ENFORCING | frozenset({"observe", "allow"})
+
+
+def _normalize_spawn_args(executable: Any, raw_args: Any) -> list[str] | None:
+    """Normalize the `subprocess.Popen` audit event into a token list.
+
+    The event fires as ``(executable, args, cwd, env)`` but the shape of `args`
+    differs by platform (verified against CPython subprocess.py):
+      * POSIX — `args` is the argv **list** the caller passed; `executable`
+        defaults to ``args[0]``.
+      * Windows — `args` is a **string** (``subprocess.list2cmdline(argv)``),
+        produced just before the audit fires; `executable` is usually None.
+
+    We return the caller's logical argv as a token list, where ``tokens[0]`` is
+    the command name as written (e.g. ``git``) — NOT the resolved binary. The
+    OS performs PATH resolution only *after* this event, so for bare-name
+    spawns no absolute path appears here. Returns None when the shape is
+    unparseable or empty (nothing to enforce).
+    """
+    if isinstance(raw_args, (list, tuple)):
+        tokens = [
+            a.decode("utf-8", "surrogateescape") if isinstance(a, bytes) else str(a)
+            for a in raw_args
+        ]
+    elif isinstance(raw_args, bytes):
+        try:
+            tokens = shlex.split(raw_args.decode("utf-8", "surrogateescape"), posix=False)
+        except ValueError:
+            return None
+    elif isinstance(raw_args, str):
+        # Windows: a list2cmdline string. shlex round-trips it well enough for a
+        # backstop; double-quotes survive on quoted values, so strip them.
+        try:
+            tokens = shlex.split(raw_args, posix=False)
+        except ValueError:
+            return None
+        tokens = [t[1:-1] if len(t) >= 2 and t[0] == '"' and t[-1] == '"' else t for t in tokens]
+    else:
+        return None
+    return tokens or None
+
+
+def _check_executable_redirect(executable: Any, command: str) -> None:
+    """Deny when an explicit `executable` redirects to a different binary.
+
+    `argv[0]` (``command``) names the command we authorize; `executable` is the
+    binary actually launched. CPython defaults `executable` to `argv[0]` on
+    POSIX and leaves it None for ordinary Windows list calls, so a non-None
+    value differing from `argv[0]` means the caller explicitly redirected the
+    spawn (the ``Popen([...], executable=...)`` spoof). Applies to every spawn —
+    the proxy forwards the agent's `executable=` kwarg without inspecting it.
+    Deliberately does not resolve PATH (kept orthogonal to the separate PATH/env
+    hardening); fails closed on the rare honest full-path use.
+    """
+    if executable is None:
+        return
+    exe = (
+        executable.decode("utf-8", "surrogateescape")
+        if isinstance(executable, bytes)
+        else str(executable)
+    )
+    if exe != command:
+        raise PermissionError(
+            f"PermissionError: spawn executable {exe!r} does not match the "
+            f"command name {command!r} it was invoked as - refusing to run a "
+            f"different binary than the one validated (audit policy: shell)."
+        )
+
+
+def evaluate_spawn_command(
+    executable: Any,
+    raw_args: Any,
+    cwd: Any = None,
+    *,
+    shell_policies: dict[str, dict],
+    workspace_root: str | None = None,
+    workspace_module_dirs: dict[str, str] | None = None,
+    proxy_validated: bool = False,
+) -> None:
+    """Validate a `subprocess.Popen` audit event against the `[shell.*]` policy.
+
+    Raises ``PermissionError`` if the spawn is not permitted; returns ``None``
+    when allowed. This is the audit-layer counterpart to the subprocess proxy's
+    validation — it reuses the SAME shared primitives (`find_matching_policy`,
+    `evaluate_arg_policy`, `evaluate_arg_paths`, `evaluate_cwd`) so the two
+    layers cannot drift.
+
+    Module-level (not a closure) so it can be unit-tested directly with both the
+    POSIX-list and Windows-string event shapes.
+
+    Command identification matches the proxy exactly: the full ``argv[0]`` token
+    is matched against the policy's command regex (``^git$`` etc.) — never a
+    basename — so an agent-planted ``workspace/hax/git.exe`` cannot impersonate
+    an allowed tool.
+
+    ``proxy_validated`` — when True, the spawn was routed through the subprocess
+    proxy, which already validated the command, args, arg-paths, and cwd
+    (including `resolve_command` interpreter rewriting the audit layer must NOT
+    re-judge). In that case only the executable-redirect check runs, since the
+    proxy forwards the agent's `executable=` kwarg without inspecting it. When
+    False (a captured-reference bypass, e.g. GitPython), the FULL validation
+    runs — command + args + arg-paths + cwd + executable.
+    """
+    tokens = _normalize_spawn_args(executable, raw_args)
+    if not tokens:
+        return  # nothing runnable / unparseable — proxy is the first line
+
+    command = tokens[0]
+    cmd_args = tokens[1:]
+
+    # The executable-redirect check applies to ALL spawns (proxy + bypass): it
+    # closes the one gap the proxy leaves open (it forwards executable= blindly).
+    _check_executable_redirect(executable, command)
+
+    if proxy_validated:
+        return  # proxy already did command/args/paths/cwd validation
+
+    _name, policy = find_matching_policy(shell_policies, command)
+    if policy is None:
+        raise PermissionError(
+            f"PermissionError: command '{command}' is not permitted — no "
+            f"matching shell policy (audit policy: shell)."
+        )
+
+    args_str = " ".join(cmd_args)
+    reason = evaluate_arg_policy(
+        args_str,
+        mode=policy.get("mode", "deny"),
+        allow=policy.get("allow", []),
+        deny=policy.get("deny", []),
+    )
+    if reason is not None:
+        raise PermissionError(
+            f"PermissionError: arguments '{args_str}' for '{command}' rejected: "
+            f"{reason} (audit policy: shell)."
+        )
+
+    if workspace_root is not None:
+        ws_path = Path(workspace_root)
+        ws_mods = workspace_module_dirs or {}
+        patterns = [p.get("command", "") for p in shell_policies.values()]
+        arg_paths_mode = policy.get("arg_paths", "workspace")
+        path_reason = evaluate_arg_paths(
+            cmd_args,
+            arg_paths=arg_paths_mode,
+            workspace_root=ws_path,
+            workspace_module_dirs=ws_mods,
+            shell_command_patterns=patterns,
+        )
+        if path_reason is not None:
+            raise PermissionError(
+                f"PermissionError: {path_reason} (audit policy: shell)."
+            )
+        cwd_reason = evaluate_cwd(
+            cwd,
+            arg_paths=arg_paths_mode,
+            workspace_root=ws_path,
+            workspace_module_dirs=ws_mods,
+            shell_command_patterns=patterns,
+        )
+        if cwd_reason is not None:
+            raise PermissionError(
+                f"PermissionError: {cwd_reason} (audit policy: shell)."
+            )
 
 
 def install_audit_enforcement(
@@ -83,6 +255,9 @@ def install_audit_enforcement(
     trusted_prefixes: tuple[str, ...] = (),
     debug: bool = False,
     log_path: str | None = None,
+    shell_policies: dict[str, dict] | None = None,
+    workspace_root: str | None = None,
+    workspace_module_dirs: dict[str, str] | None = None,
 ) -> None:
     """Install the audit-event policy engine.
 
@@ -99,6 +274,12 @@ def install_audit_enforcement(
         trusted_prefixes: normalized trusted path prefixes (caller classification).
         debug: enable the JSONL observability trail.
         log_path: destination for the debug trail.
+        shell_policies: the `[shell]` config dict (command policies for the
+            ``shell`` disposition). Required when any rule uses ``shell``.
+        workspace_root: absolute workspace root path. Required when any rule
+            uses ``shell`` (for arg-path scanning).
+        workspace_module_dirs: dict of module_name → relative_path for
+            workspace packages (write-protected during arg-path scanning).
     """
     rules = audit_rules or []
     if not rules and not debug:
@@ -294,6 +475,53 @@ def install_audit_enforcement(
             f"inside sandboxed snippets."
         )
 
+    # --- shell disposition: validate subprocess.Popen against [shell.*] ---
+    _shell_policies = shell_policies or {}
+    _workspace_root_str = workspace_root
+    _workspace_imports = workspace_module_dirs or {}
+
+    def _spawn_from_subprocess_proxy() -> bool:
+        """True if this spawn was routed through pyddock's subprocess proxy.
+
+        Every proxy-validated spawn has a `_subprocess_patch.py` frame in the
+        stack (the proxy's run/Popen wrapper calls the real Popen); a
+        captured-reference bypass (e.g. GitPython's `from subprocess import
+        Popen`) does not. The proxy already did the full validation — including
+        resolve_command interpreter rewriting and cwd checks — so the audit
+        layer skips it to avoid double-validation and false denials of
+        interpreter-rewritten script commands. The audit layer thus owns only
+        the bypass spawns the proxy cannot see.
+        """
+        frame = _REAL_GETFRAME(1)
+        while frame is not None:
+            fn = frame.f_code.co_filename.replace("\\", "/").lower()
+            if fn.endswith("/_subprocess_patch.py"):
+                return True
+            frame = frame.f_back
+        return False
+
+    def _enforce_shell(event: str, args: tuple) -> None:
+        """Validate a `subprocess.Popen` audit event against `[shell.*]`.
+
+        Event args: ``(executable, args, cwd, env)``. Delegates to the shared,
+        unit-tested `evaluate_spawn_command`. Proxy-routed spawns are flagged
+        `proxy_validated` — the proxy already validated command/args/paths/cwd
+        (with interpreter rewriting the audit layer must not re-judge), so only
+        the executable-redirect check (which the proxy doesn't do) runs for them.
+        """
+        executable = args[0] if args else None
+        raw_args = args[1] if len(args) > 1 else None
+        cwd = args[2] if len(args) > 2 else None
+        evaluate_spawn_command(
+            executable,
+            raw_args,
+            cwd,
+            shell_policies=_shell_policies,
+            workspace_root=_workspace_root_str,
+            workspace_module_dirs=_workspace_imports,
+            proxy_validated=_spawn_from_subprocess_proxy(),
+        )
+
     def _hook(event: str, args: tuple) -> None:
         disp = _resolve(event)
         # `allow` is a silent, explicit no-op (overrides a default-deny): no
@@ -314,6 +542,14 @@ def install_audit_enforcement(
                 elif disp in _FS_DISPOSITIONS:
                     try:
                         _enforce_fs(disp, event, args)
+                    except PermissionError:
+                        if _debug_log:
+                            _log_event(event, args, "deny")
+                        raise
+                    decision = "allow"
+                elif disp in _SHELL_DISPOSITIONS:
+                    try:
+                        _enforce_shell(event, args)
                     except PermissionError:
                         if _debug_log:
                             _log_event(event, args, "deny")

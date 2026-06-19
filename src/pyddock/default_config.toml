@@ -147,6 +147,9 @@ block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "_
 #                   allowlist).
 #   network       — network egress: deny from agent code, allow trusted
 #                   libraries (host/port scoping is a future refinement)
+#   shell         — subprocess spawn: validate the command vector against the
+#                   [shell.*] policies (same allow/deny/arg_paths logic as
+#                   run_shell and the subprocess proxy)
 #   observe       — log only under `serve --debug`; no enforcement
 #   allow         — explicit no-op (override a default to permit)
 #
@@ -206,14 +209,16 @@ block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "_
 "socket.sendto" = "network"
 "socket.sendmsg" = "network"
 "urllib.Request" = "network"
-# --- observe-only: process spawn (enforced by the shell policy/patch today),
-#     DNS, and recon/env surfaces. These only emit log lines under
-#     `serve --debug`. ---
-"subprocess.Popen" = "observe"
-"os.exec" = "observe"
-"os.system" = "observe"
-"os.posix_spawn" = "observe"
-"os.spawn" = "observe"
+# --- process creation: subprocess.Popen is the universal spawn chokepoint,
+#     validated against [shell.*] policies (the "shell" disposition). The raw
+#     os.exec/system/posix_spawn/spawn primitives are denied from agent code
+#     (defense-in-depth behind the os proxy; internal stdlib calls from
+#     subprocess.py come from a TRUSTED frame and pass through). ---
+"subprocess.Popen" = "shell"
+"os.exec" = "agent-deny"
+"os.system" = "agent-deny"
+"os.posix_spawn" = "agent-deny"
+"os.spawn" = "agent-deny"
 # import: enforced today by the import allowlist (builtins.__import__ guard +
 # sys.meta_path finder). Observed here to inventory volume/callers before
 # deciding on an audit-layer backstop (a future task).
@@ -281,9 +286,9 @@ class_allow = [
 
 # GitPython shells out for all git operations, but captured `from subprocess
 # import Popen` at import — so the subprocess proxy can't see it. The [shell.git]
-# policy is instead enforced at GitPython's git.cmd.Git.execute chokepoint (see
-# _gitpython_patch.py). This restriction just limits which module-level classes
-# are accessible.
+# policy is enforced at the audit layer's `shell` disposition (subprocess.Popen
+# event fires for all spawns regardless of how Popen was obtained). This
+# restriction just limits which module-level classes are accessible.
 [restrictions.git]
 mode = "deny"
 module_allow = ["Repo", "InvalidGitRepositoryError", "GitCommandError", "NoSuchPathError"]
@@ -320,7 +325,9 @@ mode = "deny"
 # Deny-always-wins: command-execution transports/options unsafe in any git
 # subcommand (fetch/pull/ls-remote/...). Blocks the ext:: transport and the
 # upload/receive-pack hooks (local RCE), regardless of the allow-list below.
-deny = ["ext::", "--upload-pack", "--receive-pack"]
+# Also blocks config/command-injection globals that, if injected before the
+# subcommand, enable arbitrary code execution (-c core.sshCommand=..., etc.).
+deny = ["ext::", "--upload-pack", "--receive-pack", "^-c(\\s|$)", "--config-env", "--exec-path"]
 allow = [
     # Read-only queries
     "status(\\s|$)", "log(\\s|$)", "diff(\\s|$)", "show(\\s|$)", "rev-parse(\\s|$)",

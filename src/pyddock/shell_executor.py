@@ -12,6 +12,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from pyddock.config import PyddockConfig, ShellPolicyConfig, find_deny_hint
 from pyddock._base import canonical_path
@@ -106,9 +107,9 @@ def resolve_command(command: str) -> list[str]:
 # ---------------------------------------------------------------------------
 #
 # These primitives are the single source of truth for how shell-policy patterns
-# are matched. They are used by all three enforcement sites — run_shell
+# are matched. They are used by all enforcement sites — run_shell
 # (ShellExecutor), subprocess.run inside run_python (_subprocess_patch), and the
-# GitPython guard (_gitpython_patch) — so the paths cannot drift.
+# audit-layer shell disposition (_audit_enforcement) — so the paths cannot drift.
 #
 # The match/search asymmetry is deliberate and security-relevant:
 #   - ALLOW patterns authorize an operation by its leading verb (position 0 of
@@ -158,6 +159,39 @@ def evaluate_arg_policy(
     return None
 
 
+def find_matching_policy(
+    shell_policies: dict[str, Any], command: str
+) -> tuple[str | None, Any | None]:
+    """Find the first [shell.*] policy whose command regex matches `command`.
+
+    The single command→policy lookup shared by all three enforcement sites:
+    run_shell (ShellExecutor, ``ShellPolicyConfig`` dataclasses), the subprocess
+    proxy (_subprocess_patch, serialized dicts), and the audit-layer shell
+    disposition (_audit_enforcement, serialized dicts). Accepts either the
+    dataclass or the dict form (see `_policy_command`).
+
+    The command token is matched in FULL via re.match against the policy's
+    `command` regex (default `^<name>$`) — never a basename — so a path like
+    `workspace/hax/git.exe` cannot match `^git$` and impersonate an allowed
+    tool. This mirrors every site's matching exactly.
+
+    Returns (policy_name, policy) in the caller's original form, or
+    (None, None) if nothing matches.
+    """
+    for name, policy in shell_policies.items():
+        pattern = _policy_command(policy) or f"^{re.escape(name)}$"
+        if re.match(pattern, command):
+            return name, policy
+    return None, None
+
+
+def _policy_command(policy: Any) -> str | None:
+    """Read a policy's command regex from either the dict or dataclass form."""
+    if isinstance(policy, dict):
+        return policy.get("command")
+    return getattr(policy, "command", None)
+
+
 def derive_protected_dir(cmd_regex: str) -> str | None:
     """Extract the clean directory portion from a path-like shell command regex.
 
@@ -197,9 +231,9 @@ def evaluate_arg_paths(
     """Scan command args for path-like values and validate against arg_paths.
 
     This is the single source of truth for path-argument scanning, shared by all
-    three enforcement sites: run_shell (ShellExecutor), subprocess.run inside
-    run_python (_subprocess_patch), and the GitPython guard (_gitpython_patch).
-    Keeping it here guarantees the three paths cannot drift.
+    enforcement sites: run_shell (ShellExecutor), subprocess.run inside
+    run_python (_subprocess_patch), and the audit-layer shell disposition.
+    Keeping it here guarantees the paths cannot drift.
 
     Args:
         args: The command arguments (excluding the command/subcommand-launching
@@ -284,6 +318,86 @@ def evaluate_arg_paths(
                         f"the workspace. Shell commands are restricted to workspace-"
                         f"relative paths (arg_paths = \"workspace\")."
                     )
+
+    return None
+
+
+def evaluate_cwd(
+    cwd: Any,
+    *,
+    arg_paths: str,
+    workspace_root: Path,
+    workspace_module_dirs: dict[str, str],
+    shell_command_patterns: list[str],
+) -> str | None:
+    """Validate a subprocess working directory against the arg_paths policy.
+
+    Unlike `evaluate_arg_paths` (which filters path-*looking* args), a cwd is
+    always a directory and is therefore always resolved and checked. Blocks a
+    cwd inside `.pyddock/` (except `.pyddock/tmp/`), a workspace module dir, a
+    shell-executable script dir, or — in "workspace" mode — anywhere outside the
+    workspace. Mirrors the subprocess proxy's cwd check so the proxy and the
+    audit-layer shell disposition stay aligned.
+
+    Returns None if the cwd is permitted, else a rejection message.
+    """
+    if cwd is None or arg_paths == "none":
+        return None
+
+    cwd_str = cwd.decode("utf-8", "surrogateescape") if isinstance(cwd, bytes) else str(cwd)
+    ws_root_abs = _abspath(workspace_root)
+    pyddock_dir = _abspath(workspace_root / ".pyddock")
+    resolved = _abspath(workspace_root / Path(cwd_str))
+
+    # 1. .pyddock/ (excluding .pyddock/tmp/)
+    try:
+        rel = resolved.relative_to(pyddock_dir)
+        if not str(rel).startswith("tmp"):
+            return (
+                f"cwd '{cwd_str}' targets the protected .pyddock/ directory. "
+                f"Subprocess cwd cannot be set to .pyddock/ "
+                f"(self-modification protection)."
+            )
+    except ValueError:
+        pass
+
+    # 2. Workspace module directories
+    for mod_name, rel_path in workspace_module_dirs.items():
+        try:
+            resolved.relative_to(_abspath(workspace_root / rel_path))
+            return (
+                f"cwd '{cwd_str}' targets workspace module directory "
+                f"'{mod_name}' ({rel_path}). Subprocess cwd cannot be set to "
+                f"workspace module directories."
+            )
+        except ValueError:
+            continue
+
+    # 3. Shell-executable script directories
+    for cmd_regex in shell_command_patterns:
+        clean_dir = derive_protected_dir(cmd_regex)
+        if clean_dir is None:
+            continue
+        try:
+            resolved.relative_to(_abspath(workspace_root / clean_dir))
+            return (
+                f"cwd '{cwd_str}' targets a shell-executable script directory "
+                f"({clean_dir}). Subprocess cwd cannot be set to script "
+                f"directories (write-then-execute prevention)."
+            )
+        except ValueError:
+            continue
+
+    # 4. "workspace" mode: block cwd outside the workspace
+    if arg_paths == "workspace":
+        try:
+            resolved.relative_to(ws_root_abs)
+        except ValueError:
+            return (
+                f"cwd '{cwd_str}' resolves to '{resolved}' which is outside the "
+                f"workspace. Subprocess cwd is restricted to the workspace "
+                f"directory (arg_paths = \"workspace\")."
+            )
 
     return None
 
@@ -437,13 +551,12 @@ class ShellExecutor:
     def _find_matching_policy(self, command: str) -> ShellPolicyConfig | None:
         """Find the first shell policy whose command regex matches.
 
-        Iterates policies in dict insertion order (TOML section order).
-        Returns None if no policy matches.
+        Delegates to the shared find_matching_policy() so run_shell, the
+        subprocess proxy, and the audit shell disposition use one command→policy
+        lookup and cannot drift. Returns None if no policy matches.
         """
-        for policy in self._config.shell.values():
-            if re.match(policy.command, command):
-                return policy
-        return None
+        _name, policy = find_matching_policy(self._config.shell, command)
+        return policy
 
     def _check_args_policy(
         self, policy: ShellPolicyConfig, args: list[str]
@@ -452,7 +565,7 @@ class ShellExecutor:
 
         Returns None if args are permitted, or an error message string if rejected.
         Delegates the allow/deny decision to the shared evaluate_arg_policy() so
-        run_shell, subprocess.run, and the GitPython guard stay in lockstep.
+        run_shell, subprocess.run, and the audit shell disposition stay in lockstep.
         """
         args_str = " ".join(args)
         reason = evaluate_arg_policy(
@@ -483,8 +596,8 @@ class ShellExecutor:
         """Scan args for path-like values and validate against arg_paths policy.
 
         Thin wrapper over the shared evaluate_arg_paths() so run_shell stays in
-        lockstep with subprocess.run (_subprocess_patch) and the GitPython guard
-        (_gitpython_patch).
+        lockstep with subprocess.run (_subprocess_patch) and the audit-layer
+        shell disposition.
 
         Modes:
           "workspace" — block any path-like arg that resolves outside the workspace

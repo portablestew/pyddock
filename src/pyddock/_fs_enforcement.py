@@ -653,4 +653,7 @@ def apply_filesystem_scoping(
         trusted_prefixes=trusted_prefixes,
         debug=debug,
         log_path=str(workspace_root / ".pyddock" / "tmp" / "audit.jsonl") if debug else None,
+        shell_policies=config.get("shell", {}),
+        workspace_root=str(workspace_root),
+        workspace_module_dirs=config.get("imports", {}).get("workspace", {}),
     )

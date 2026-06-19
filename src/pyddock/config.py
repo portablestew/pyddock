@@ -65,7 +65,8 @@ class ASTConfig:
 
 # Audit-event dispositions. Mirrors VALID_DISPOSITIONS in _audit_enforcement.
 _VALID_AUDIT_DISPOSITIONS = (
-    "fs", "fs-write", "fs-write-pair", "agent-deny", "network", "observe", "allow",
+    "fs", "fs-write", "fs-write-pair", "agent-deny", "network", "shell",
+    "observe", "allow",
 )
 
 
