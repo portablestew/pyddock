@@ -11,6 +11,7 @@ internal state via object.__getattribute__.
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import re
 import sys
@@ -19,6 +20,8 @@ from typing import Any
 
 from pyddock._base import _find_deny_hint, _is_module_bound_builtin, _wrap_safe_callable
 from pyddock._import_hook import _caller_is_trusted
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # MethodFilterProxy
@@ -426,7 +429,16 @@ def _build_trusted_prefixes(
 
     Returns normalized, resolved path prefixes for:
     1. Workspace module directories (editable installs)
-    2. The venv's site-packages (transitive deps)
+    2. The .pyddock/venv site-packages — the single authoritative source of
+       third-party library code — plus the realpath targets of the venv's own
+       symlinked entries (so uv's symlink link-mode, where the venv's packages
+       physically live in a shared cache, still resolves as trusted). The venv
+       is deliberately the ONLY library location trusted: this keeps the trusted
+       set a closed, config-pinned unit so sandbox behavior is repeatable across
+       machines and install methods, and does not depend on how pyddock itself
+       was installed (e.g. a uvx tool cache on sys.path) or on shared-cache
+       contents. A package missing from the venv therefore fails loudly rather
+       than being silently trusted from elsewhere on sys.path.
     3. The Python stdlib Lib directory
     """
     _os = real_os if real_os is not None else __import__("os")
@@ -439,21 +451,91 @@ def _build_trusted_prefixes(
         )
         prefixes.append(abs_path)
 
-    # 2. Venv site-packages (transitive deps of allowed packages)
+    # 2. The .pyddock/venv site-packages (the authoritative library location).
+    #
+    # The trusted set must match where library code physically lives, because
+    # _caller_is_trusted compares each caller frame's realpath()-resolved
+    # filename against these prefixes. We trust the venv's site-packages and the
+    # realpath targets of ITS symlinked entries — nothing else on sys.path.
+    #
+    # We intentionally do NOT trust arbitrary site-packages/dist-packages dirs
+    # found on sys.path (e.g. a uvx tool cache that the bootstrap places on the
+    # path, or the per-user site). Trusting those would make the trusted set
+    # depend on install layout and shared-cache state, hurting repeatability and
+    # widening the attack surface. The companion fix in executor.py appends
+    # pyddock's install dir to sys.path (instead of prepending it) so allowed
+    # packages resolve from this venv, not from such a cache.
+    candidate_site_dirs: list[str] = []
     if venv_path is not None and venv_path.is_dir():
         # Find site-packages inside the venv (Windows: Lib/site-packages)
         for root, dirs, _files in _os.walk(str(venv_path / "Lib")):
             if "site-packages" in dirs:
-                sp = _os.path.join(root, "site-packages")
-                prefixes.append(_os.path.normcase(_os.path.realpath(sp)))
+                candidate_site_dirs.append(_os.path.join(root, "site-packages"))
                 break
         else:
             # Unix-style layout: lib/pythonX.Y/site-packages
             for root, dirs, _files in _os.walk(str(venv_path / "lib")):
                 if "site-packages" in dirs:
-                    sp = _os.path.join(root, "site-packages")
-                    prefixes.append(_os.path.normcase(_os.path.realpath(sp)))
+                    candidate_site_dirs.append(
+                        _os.path.join(root, "site-packages")
+                    )
                     break
+
+    # A site-packages dir INSIDE the workspace (other than the write-protected
+    # .pyddock/venv) is agent-writable (writable_paths defaults to ["."]), so
+    # trusting it would let agent code plant a shadowing module and have it run
+    # with full library privileges (free imports, deny-agent secret reads). Skip
+    # such dirs and warn — this fires only in the rare case one actually exists
+    # (e.g. a symlink target resolving back into the workspace), so it does not
+    # pollute normal snippet output.
+    _ws_real = _os.path.normcase(_os.path.realpath(str(workspace_root)))
+    _venv_real = (
+        _os.path.normcase(_os.path.realpath(str(venv_path)))
+        if venv_path is not None
+        else None
+    )
+
+    def _within(child: str, parent: str) -> bool:
+        return child == parent or child.startswith(parent + _os.sep)
+
+    def _is_agent_writable(resolved: str) -> bool:
+        if not _within(resolved, _ws_real):
+            return False  # outside the workspace (shared cache, system site) — fine
+        if _venv_real is not None and _within(resolved, _venv_real):
+            return False  # the managed, write-protected .pyddock/venv — fine
+        return True  # inside workspace, outside the managed venv — agent-writable
+
+    def _add_trusted(resolved: str, *, origin: str) -> None:
+        if not _os.path.isdir(resolved):
+            return
+        if _is_agent_writable(resolved):
+            logger.warning(
+                "Refusing to trust site-packages directory inside the workspace "
+                "(agent-writable, import-shadowing risk): %s (via %s)",
+                resolved, origin,
+            )
+            return
+        prefixes.append(resolved)
+
+    # Trust the venv site-packages and, for uv symlink-mode venvs, the realpath
+    # targets of the venv's symlinked entries (the venv's own packages stored in
+    # a shared cache). This stays scoped to the venv's declared contents — we do
+    # not scan sys.path.
+    for _sp in candidate_site_dirs:
+        _add_trusted(
+            _os.path.normcase(_os.path.realpath(_sp)), origin="venv site-packages"
+        )
+        try:
+            _entries = _os.listdir(_sp)
+        except OSError:
+            continue
+        for _name in _entries:
+            _child = _os.path.join(_sp, _name)
+            if _os.path.islink(_child):
+                _target_dir = _os.path.dirname(
+                    _os.path.normcase(_os.path.realpath(_child))
+                )
+                _add_trusted(_target_dir, origin="venv symlink target")
 
     # 3. Python stdlib Lib directory
     # Use sys.base_prefix to handle virtualenvs correctly — it points to

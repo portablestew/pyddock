@@ -173,7 +173,16 @@ class SubprocessExecutor:
             "import sys",
             "import ast as _ast",
             "import types as _pyddock_types",
-            f"sys.path.insert(0, {pyddock_src_path!r})",
+            # APPEND (not insert at 0) so pyddock stays importable without letting
+            # pyddock's install location win the import-resolution race against the
+            # .pyddock/venv. When pyddock is provisioned by a tool like uv, its
+            # install dir is a shared cache that also contains pyddock's deps
+            # (e.g. cryptography). Prepending it shadowed the venv copy, so those
+            # packages loaded from the (untrusted) cache and their internal imports
+            # (`from __future__ import annotations`, `import warnings`, ...) were
+            # rejected. Appending lets the venv's site-packages take precedence;
+            # pyddock itself is only in this dir, so it is still found here.
+            f"sys.path.append({pyddock_src_path!r})",
             f"sys.argv = [{SNIPPET_FILENAME!r}] + {args!r}",
             "",
             "# Apply runtime enforcement",

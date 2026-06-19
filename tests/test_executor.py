@@ -268,3 +268,33 @@ class TestOutputTruncation:
         assert result.exit_code == 0
         assert "[truncated:" not in result.stdout
         assert "hello" in result.stdout
+
+
+class TestBootstrapPathPrecedence:
+    """The bootstrap must not let pyddock's install dir shadow the venv.
+
+    pyddock may be provisioned by a tool (e.g. uv) whose install location is a
+    shared cache that also contains pyddock's dependencies (cryptography, etc.).
+    Prepending that dir to sys.path made those packages resolve from the
+    untrusted cache instead of the trusted .pyddock/venv, which broke their
+    internal imports. The bootstrap must APPEND pyddock's path so the venv wins
+    the resolution race while pyddock itself stays importable.
+    """
+
+    def test_bootstrap_appends_pyddock_path_not_prepends(
+        self, executor: SubprocessExecutor, workspace: Path
+    ) -> None:
+        bootstrap = executor._build_bootstrap("1 + 1", [], workspace)
+        assert "sys.path.append(" in bootstrap
+        assert "sys.path.insert(0, " not in bootstrap
+
+    def test_appended_path_is_after_argv_setup_but_present(
+        self, executor: SubprocessExecutor, workspace: Path
+    ) -> None:
+        # The pyddock path must still be on sys.path (so the subprocess can
+        # import pyddock), just not at the front.
+        import pyddock
+
+        bootstrap = executor._build_bootstrap("1 + 1", [], workspace)
+        pyddock_src = str(Path(pyddock.__file__).parent.parent)
+        assert f"sys.path.append({pyddock_src!r})" in bootstrap
