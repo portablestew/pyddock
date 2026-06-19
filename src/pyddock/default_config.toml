@@ -97,6 +97,7 @@ readable_paths = ["*"]
 '/\.pypirc$' = "deny-all"               # PyPI registry tokens — no library reader in sandbox
 '/\.git-credentials$' = "deny-all"       # Git plaintext passwords — no library reader in sandbox
 '/\.env(\.[^/]*)?$' = "workspace"        # .env files — workspace only
+'/\.git/' = "read-only"                   # Git internals — hooks execute as child processes (sandbox-escape vector); also blocks ref/config/index self-modification. Does NOT match .gitignore/.gitattributes/.gitmodules. git CLI writes happen in the child git.exe (a separate process), so allowed git operations are unaffected; only direct Python writes into .git/ (e.g. GitPython's pure-Python index.write()) are blocked.
 '/\.kiro/agent' = "read-only"             # Kiro agent config — prevent self-modification
 '/\.kiro/settings' = "read-only"          # Kiro settings — prevent self-modification
 '/\.claude/settings' = "read-only"        # Claude settings — prevent self-modification
@@ -360,10 +361,15 @@ allow = [
 [shell.git.env]
 deny = [
     "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND",  # arbitrary command on transport
-    "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR",     # arbitrary command on diff/page/edit
+    "GIT_ASKPASS", "SSH_ASKPASS",                       # arbitrary command on credential/password prompt
+    "GIT_EXTERNAL_DIFF", "GIT_PAGER",                   # arbitrary command on diff / paging
+    "GIT_EDITOR", "GIT_SEQUENCE_EDITOR",                # arbitrary command on commit-msg edit / rebase-todo edit (rebase -i)
+    "GIT_EXEC_PATH",                                    # git-* subprogram lookup dir (env form of the denied --exec-path)
     "GIT_CONFIG.*",                                     # incl. GIT_CONFIG_COUNT/KEY_n/VALUE_n injection
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",       # redirect repo/index out of tree
+    "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",           # redirect common dir / object store out of tree
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_TEMPLATE_DIR",                                 # template dir (incl. hooks) copied into new repos on init/clone
     "GIT_TRACE.*",                                      # GIT_TRACE=<path> → arbitrary file write
 ]
 
@@ -390,20 +396,22 @@ allow = [
 ]
 
 [shell.p4.env]
-deny = ["P4PORT", "P4CONFIG", "P4DIFF", "P4MERGE", "P4EDITOR"]
+deny = ["P4PORT", "P4CONFIG", "P4DIFF", "P4MERGE", "P4EDITOR", "P4LOGINSSO"]
 
 [shell.docker]
-# Compose-only policy: scoped to the workspace's docker-compose.yml.
-# No bare run/exec (shell-escape vectors), no push/login/save/export.
+# Read-only / inspection ONLY. All container lifecycle (compose up/down/build/
+# run/exec/stop/restart/pull) is intentionally disallowed: the compose file lives
+# in the agent-writable workspace, so any container start can bind-mount the host
+# and run as root — a full host escape the arg/path scanners cannot see (the
+# dangerous bits live inside the YAML, not the args). If you genuinely need
+# container lifecycle, grant it through a trusted shell tool, not pyddock.
 # Verbs anchored with (\s|$) (see [shell.git]).
 mode = "deny"
 allow = [
-    # Compose lifecycle
-    "compose up(\\s|$)", "compose down(\\s|$)", "compose build(\\s|$)",
-    "compose ps(\\s|$)", "compose logs(\\s|$)", "compose exec(\\s|$)",
-    "compose run(\\s|$)", "compose stop(\\s|$)", "compose restart(\\s|$)",
-    "compose pull(\\s|$)", "compose config(\\s|$)", "compose top(\\s|$)",
-    "compose images(\\s|$)", "compose port(\\s|$)", "compose version(\\s|$)",
+    # Compose inspection (read-only)
+    "compose ps(\\s|$)", "compose logs(\\s|$)", "compose config(\\s|$)",
+    "compose top(\\s|$)", "compose images(\\s|$)", "compose port(\\s|$)",
+    "compose version(\\s|$)",
     # Container/image inspection (read-only)
     "ps(\\s|$)", "inspect(\\s|$)", "logs(\\s|$)", "top(\\s|$)", "stats(\\s|$)", "port(\\s|$)",
     "images(\\s|$)", "image ls(\\s|$)", "image inspect(\\s|$)", "image history(\\s|$)",
