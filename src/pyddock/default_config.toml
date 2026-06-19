@@ -219,9 +219,13 @@ block_attributes = ["__subclasses__", "__globals__", "__code__", "__bases__", "_
 "os.system" = "agent-deny"
 "os.posix_spawn" = "agent-deny"
 "os.spawn" = "agent-deny"
-# import: enforced today by the import allowlist (builtins.__import__ guard +
-# sys.meta_path finder). Observed here to inventory volume/callers before
-# deciding on an audit-layer backstop (a future task).
+# import: enforced by the import allowlist (builtins.__import__ guard +
+# sys.meta_path finder). Kept at `observe` for --debug inventory only: it is NOT
+# promoted to an enforcing disposition. On CPython 3.14 the `import` audit event
+# fires only on a sys.modules cache MISS (inside importlib._find_and_load), never
+# for already-cached modules — so it cannot see the cached-transitive-dep gap an
+# audit backstop would target, and on cache misses the meta_path _ImportBlocker
+# already enforces.
 "import" = "observe"
 "socket.getaddrinfo" = "observe"
 "socket.gethostbyname" = "observe"
