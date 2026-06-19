@@ -396,7 +396,21 @@ allow = [
 ]
 
 [shell.p4.env]
-deny = ["P4PORT", "P4CONFIG", "P4DIFF", "P4MERGE", "P4EDITOR", "P4LOGINSSO"]
+# p4 honors several vars that run an external program or load settings (which
+# can themselves re-introduce an exec var) — the env-side equivalents of the
+# command-execution denials. P4CONFIG and P4ENVIRO point to settings files that
+# can define P4EDITOR/P4DIFF/etc., so locking only the exec vars without locking
+# the loaders leaves a redirect (a bare `P4ENVIRO=z.txt` carries no separator,
+# so the inert filter alone won't stop it — hence the hard-lock here).
+deny = [
+    "P4PORT", "P4CONFIG", "P4ENVIRO",        # connection target / settings-file loaders
+    "P4DIFF.*",                              # arbitrary command on diff (incl. P4DIFFUNICODE)
+    "P4MERGE.*",                             # arbitrary command on resolve/merge (incl. P4MERGEUNICODE)
+    "P4EDITOR",                              # arbitrary command on spec edit (p4 change, ...)
+    "P4PAGER",                               # arbitrary command on paged output
+    "P4LOGINSSO",                            # arbitrary command on SSO login
+    "P4ALIASES",                             # aliases file can rewrite an allowed verb into a denied one (allow-list bypass)
+]
 
 [shell.docker]
 # Read-only / inspection ONLY. All container lifecycle (compose up/down/build/

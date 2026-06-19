@@ -63,6 +63,25 @@ class TestIsUnsafeEnvValue:
         # catch GIT_SSH_COMMAND=calc.exe — a deny lock must.
         assert is_unsafe_env_value("calc.exe") is False
 
+    def test_bare_filename_that_exists_is_unsafe(self, tmp_path: Path) -> None:
+        # A separator-less value that names a REAL file/dir is unsafe: a tool may
+        # resolve it as a path relative to its cwd (e.g. p4 P4ENVIRO=z.txt). This
+        # is the bare-filename gap that let P4ENVIRO slip past the inert filter.
+        (tmp_path / "z_enviro.txt").write_text("P4EDITOR=evil")
+        (tmp_path / "adir").mkdir()
+        assert is_unsafe_env_value("z_enviro.txt", (tmp_path,)) is True
+        assert is_unsafe_env_value("adir", (tmp_path,)) is True
+
+    def test_bare_filename_that_does_not_exist_stays_inert(self, tmp_path: Path) -> None:
+        assert is_unsafe_env_value("nope.txt", (tmp_path,)) is False
+
+    def test_resolve_bases_checks_each_base(self, tmp_path: Path) -> None:
+        base_a = tmp_path / "a"; base_a.mkdir()
+        base_b = tmp_path / "b"; base_b.mkdir()
+        (base_b / "settings").write_text("x")
+        # Present only under the second base — still detected.
+        assert is_unsafe_env_value("settings", (base_a, base_b)) is True
+
 
 # ---------------------------------------------------------------------------
 # resolve_env_policy
@@ -149,6 +168,26 @@ class TestFilterChildEnv:
         with pytest.raises(PermissionError):
             self._filter({"SOME_NEW_TOOL_HOME": "/opt/tool"})
 
+    def test_inert_default_rejects_bare_filename_that_exists(self, tmp_path: Path) -> None:
+        # End-to-end of the bare-filename gap through the proxy filter: an
+        # unknown var set to a separator-less value naming a real file is
+        # rejected when resolve_bases (the spawn's cwd/workspace) is supplied.
+        (tmp_path / "z_enviro.txt").write_text("P4EDITOR=evil")
+        with pytest.raises(PermissionError):
+            filter_child_env(
+                {"P4ENVIRO_UNKNOWN": "z_enviro.txt"}, SNAPSHOT,
+                deny_patterns=self.DENY, default="inert",
+                resolve_bases=(tmp_path,),
+            )
+
+    def test_inert_default_allows_bare_filename_when_absent(self, tmp_path: Path) -> None:
+        out = filter_child_env(
+            {"SOME_TOKEN": "not_a_real_file"}, SNAPSHOT,
+            deny_patterns=self.DENY, default="inert",
+            resolve_bases=(tmp_path,),
+        )
+        assert out["SOME_TOKEN"] == "not_a_real_file"
+
     def test_snapshot_default_rejects_any_override(self) -> None:
         with pytest.raises(PermissionError):
             self._filter({"GIT_AUTHOR_EMAIL": "a@b.com"}, default="snapshot")
@@ -216,6 +255,13 @@ class TestBundledDefaultPolicy:
             ("git", "GIT_SSH_COMMAND"),
             ("git", "GIT_CONFIG_COUNT"),
             ("p4", "P4PORT"),
+            ("p4", "P4ENVIRO"),        # settings-file loader (the bare-filename escape)
+            ("p4", "P4DIFF"),          # external diff (base name, via P4DIFF.*)
+            ("p4", "P4DIFFUNICODE"),   # external diff (unicode variant, via P4DIFF.*)
+            ("p4", "P4MERGE"),         # external merge (base name, via P4MERGE.*)
+            ("p4", "P4MERGEUNICODE"),  # external merge (unicode variant, via P4MERGE.*)
+            ("p4", "P4PAGER"),         # external pager
+            ("p4", "P4ALIASES"),       # allow-list bypass via alias rewrite
             ("docker", "DOCKER_HOST"),
         ],
     )

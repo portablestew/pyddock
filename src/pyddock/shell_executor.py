@@ -179,7 +179,7 @@ def evaluate_arg_policy(
 _ENV_URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
 
-def is_unsafe_env_value(value: str) -> bool:
+def is_unsafe_env_value(value: str, resolve_bases: tuple[Path, ...] = ()) -> bool:
     """True if an env value looks like a filesystem path or a URI.
 
     Tuned for ENV VALUES, deliberately NOT reusing `_looks_like_path` (which is
@@ -187,9 +187,18 @@ def is_unsafe_env_value(value: str) -> bool:
     `\\\\server\\share` and `scheme://host` are exactly the dangerous redirects
     we want to catch. False positives are acceptable (the agent merely can't set
     that var to a path); false negatives for the path/URI class are the only real
-    risk. No filesystem access and no `which` — this is the cheap, deterministic
-    half of the value filter; command-execution vars are covered by the per-
-    command hard-locks instead.
+    risk.
+
+    The separator/drive/URI checks are the cheap, deterministic half — they need
+    no filesystem access. The optional `resolve_bases` adds the one I/O-bearing
+    case they miss: a value with NO separators that nonetheless names a real file
+    or directory. A tool can resolve such a bare token as a path relative to its
+    working directory (e.g. p4 reads `P4ENVIRO=z.txt` relative to cwd and loads
+    P4EDITOR/P4DIFF from it — a command-execution redirect carrying no separator).
+    When `resolve_bases` is supplied (the spawn's cwd / workspace root), a value
+    that resolves to an existing entry under any base is treated as unsafe.
+    Command-execution vars that need no existing file (e.g. GIT_SSH_COMMAND=calc)
+    are covered by the per-command hard-locks instead.
     """
     if not value:
         return False
@@ -201,6 +210,13 @@ def is_unsafe_env_value(value: str) -> bool:
         return True                           # C:\...  drive-qualified
     if _ENV_URI_RE.match(value):              # tcp://  http://  ssh://  ...
         return True
+    # Separator-less but names a real file/dir → a tool may resolve it as a path.
+    for base in resolve_bases:
+        try:
+            if (base / value).exists():
+                return True
+        except (OSError, ValueError):
+            continue
     return False
 
 
@@ -273,6 +289,7 @@ def filter_child_env(
     *,
     deny_patterns: list[str],
     default: str,
+    resolve_bases: tuple[Path, ...] = (),
 ) -> dict[str, str]:
     """Return the env a child may receive, or raise PermissionError.
 
@@ -281,7 +298,9 @@ def filter_child_env(
       * value == ""              → allowed (explicit removal of the var)
       * key locked (deny match)  → rejected (only snapshot/empty allowed above)
       * default == "snapshot"    → rejected (only snapshot/empty permitted)
-      * default == "inert"       → allowed iff the value is not path/URI-like
+      * default == "inert"       → allowed iff the value is not path/URI-like and
+                                   does not name an existing file/dir under any of
+                                   `resolve_bases` (the spawn's cwd / workspace)
 
     Keys the agent does not mention keep their snapshot value. Used by the
     subprocess proxy, which both rewrites (the returned dict) and rejects.
@@ -310,7 +329,7 @@ def filter_child_env(
                 f"overridden (env policy: snapshot — only the known-good value or "
                 f"removal is permitted)."
             )
-        if is_unsafe_env_value(value):
+        if is_unsafe_env_value(value, resolve_bases):
             raise PermissionError(
                 f"PermissionError: refusing environment override {key}={value!r} — "
                 f"the value looks like a path or URI, which can redirect a tool to "

@@ -161,13 +161,31 @@ def apply_subprocess_patch(
         receives the known-good snapshot rather than inheriting the sandbox
         process environment. Raises PermissionError if an override violates the
         resolved [env] / [shell.<cmd>.env] policy.
+
+        The resolution bases (the spawn's effective cwd plus the workspace root)
+        let the inert-value filter reject a separator-less value that names a
+        real file/dir — a tool may resolve such a bare token as a path relative
+        to its cwd (e.g. p4 loading P4EDITOR/P4DIFF from a bare P4ENVIRO file).
         """
         deny_patterns, env_default = resolve_env_policy(_env_base, policy)
+        resolve_bases: list[pathlib.Path] = [_ws_root]
+        cwd = kwargs.get("cwd")
+        if cwd is not None:
+            cwd_str = (
+                cwd.decode("utf-8", "surrogateescape")
+                if isinstance(cwd, (bytes, bytearray))
+                else str(cwd)
+            )
+            # `_ws_root / cwd_str` yields cwd_str unchanged when it is absolute,
+            # and resolves it against the workspace when relative — matching how
+            # the child process resolves its own cwd.
+            resolve_bases.append(_ws_root / cwd_str)
         kwargs["env"] = filter_child_env(
             kwargs.get("env"),
             _env_snapshot,
             deny_patterns=deny_patterns,
             default=env_default,
+            resolve_bases=tuple(resolve_bases),
         )
 
     def _validated_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
