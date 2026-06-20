@@ -884,3 +884,81 @@ class TestReExportingPackageProxy:
         assert "BLOCKED_OS" in result.stdout
         assert "LEAKED" not in result.stdout
 
+    def test_reexported_public_api_accessible_via_from_import(
+        self, workspace_with_reexport_pkg: Path, venv_manager: VenvManager
+    ) -> None:
+        """`from <pkg> import <subpkg>` must expose the same full API as a
+        direct `import <pkg>.<subpkg>`.
+
+        The from-import form loads the subpackage via importlib's
+        _handle_fromlist -> _gcd_import, bypassing the __import__ hook. A
+        re-entrant `from <pkg>.<subpkg> import ...` inside the subpackage's own
+        __init__ then looked "outermost" and used to freeze a partial proxy
+        (missing the names defined after the imports). This is the exact
+        cryptography `from cryptography import x509` -> missing `x509.Name` bug.
+        """
+        workspace = workspace_with_reexport_pkg
+
+        config = PyddockConfig(
+            execution=ExecutionConfig(timeout=30.0),
+            imports=ImportsConfig(
+                allowed=["reexport_pkg", "os"],
+                workspace={"reexport_pkg": "reexport_pkg"},
+            ),
+            filesystem=FilesystemConfig(writable_paths=["."], readable_paths=["*"]),
+            ast=ASTConfig(block_calls=[], block_attributes=[]),
+            restrictions={},
+        )
+        executor = self._make_executor_with_pkg_path(config, venv_manager, workspace)
+
+        # from-import is the FIRST thing that triggers the subpackage import.
+        source = (
+            "from reexport_pkg import sub\n"
+            "for attr in ('PublicThing', 'make_thing'):\n"
+            "    print(('OK: ' if hasattr(sub, attr) else 'MISSING: ') + attr)\n"
+            "thing = sub.make_thing()\n"
+            "print(f'VALUE={thing.value}')\n"
+        )
+        result = executor.execute(source, [], 30, workspace)
+
+        assert result.exit_code == 0, result.stderr
+        assert "OK: PublicThing" in result.stdout
+        assert "OK: make_thing" in result.stdout
+        assert "VALUE=7" in result.stdout
+        assert "MISSING" not in result.stdout
+
+    def test_from_import_module_leakage_still_blocked(
+        self, workspace_with_reexport_pkg: Path, venv_manager: VenvManager
+    ) -> None:
+        """The from-import fix must not expose leaked stdlib modules.
+
+        Even though the public API is now reachable via from-import, the
+        subpackage's module-scope `import os` must stay inaccessible.
+        """
+        workspace = workspace_with_reexport_pkg
+
+        config = PyddockConfig(
+            execution=ExecutionConfig(timeout=30.0),
+            imports=ImportsConfig(
+                allowed=["reexport_pkg", "os"],
+                workspace={"reexport_pkg": "reexport_pkg"},
+            ),
+            filesystem=FilesystemConfig(writable_paths=["."], readable_paths=["*"]),
+            ast=ASTConfig(block_calls=[], block_attributes=[]),
+            restrictions={},
+        )
+        executor = self._make_executor_with_pkg_path(config, venv_manager, workspace)
+
+        source = (
+            "from reexport_pkg import sub\n"
+            "try:\n"
+            "    leaked = sub.os\n"
+            "    print('LEAKED_OS')\n"
+            "except AttributeError as e:\n"
+            "    print(f'BLOCKED_OS: {e}')\n"
+        )
+        result = executor.execute(source, [], 30, workspace)
+
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED_OS" in result.stdout
+        assert "LEAKED" not in result.stdout

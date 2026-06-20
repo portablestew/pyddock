@@ -595,6 +595,17 @@ def _proxy_module_universal(
     if name in skip_modules or top_level in skip_modules:
         return
 
+    # Never proxy a partially-initialized module. A re-entrant import from inside
+    # a package's own __init__.py (e.g. `from cryptography.x509 import oid`,
+    # executed before x509 has bound its public classes) can reach here with the
+    # module still mid-init; proxying now would freeze an incomplete exported API
+    # (the original `from cryptography import x509` -> missing `x509.Name` bug).
+    # __spec__._initializing is True only while the module body is executing and
+    # flips to False once init completes; proxy only after the module is fully
+    # loaded. getattr fallback: a module without __spec__ is treated as complete.
+    if getattr(getattr(module, "__spec__", None), "_initializing", False):
+        return
+
     # Compute the exported API — these attrs are always accessible to agent code.
     # Workspace modules get stricter filtering: foreign classes are excluded
     # to prevent leakage of network-capable factories (e.g. Jira, SSHClient),

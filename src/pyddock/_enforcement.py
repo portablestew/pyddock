@@ -264,6 +264,28 @@ class RuntimeEnforcement:
                         name, _trusted, _skip_proxy, _ws_module_names,
                         include_private=True,
                     )
+                # `from <pkg> import <submodule>` loads the submodule through
+                # importlib's _handle_fromlist -> _gcd_import, which BYPASSES this
+                # hook. So the submodule never reaches the "." in name path above,
+                # and the package name is never registered in _loading_names —
+                # which made a re-entrant `from <pkg> import <sub>` inside the
+                # package's own __init__.py look "outermost" and (before the
+                # _initializing guard in _proxy_module_universal) freeze a partial
+                # proxy. Proxy the fromlist submodules here, after the parent (and
+                # the submodule) have fully loaded, so `from cryptography import
+                # x509` yields the same full-API proxy as `import cryptography.x509`.
+                if is_outermost:
+                    fromlist = args[2] if len(args) > 2 else kwargs.get("fromlist")
+                    if fromlist:
+                        for entry in fromlist:
+                            if not isinstance(entry, str) or entry == "*":
+                                continue
+                            submod = name + "." + entry
+                            if submod in sys.modules:
+                                _proxy_module_universal(
+                                    submod, _trusted, _skip_proxy,
+                                    _ws_module_names, include_private=True,
+                                )
                 return result
             # If the module was explicitly pre-warmed as a stdlib internal
             # (e.g. _strptime), allow re-import from cache. These are lazily
