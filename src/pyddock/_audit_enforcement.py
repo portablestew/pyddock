@@ -457,6 +457,15 @@ def install_audit_enforcement(
             pass
 
     def _enforce_fs(disp: str, event: str, args: tuple) -> None:
+        # NOTE on path-resolution TOCTOU: every fs audit event carries the path
+        # value the syscall actually uses — primitives resolve __fspath__ ONCE
+        # and raise the event with that resolved str (verified: builtins.open /
+        # io.open / os.open / os.mkdir / os.remove / os.scandir deliver a str;
+        # _io.FileIO raises 'open' first with its single resolved str, then a
+        # redundant event with the original object). So the check here always
+        # sees the true target — there is no second, independent resolution to
+        # exploit. The materialize-once name-patch layer closes the only real
+        # gap (its separate check/use resolutions). Hence no object-type guard.
         if disp == "fs":  # open
             path = _extract_path(args[0] if args else None)
             if path is None:

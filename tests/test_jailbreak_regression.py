@@ -28,6 +28,7 @@ from pyddock.venv_manager import VenvManager
 
 from pyddock.config import (
     ASTConfig,
+    AuditConfig,
     ExecutionConfig,
     FilesystemConfig,
     ImportsConfig,
@@ -185,6 +186,216 @@ class TestAdsWriteBlockedEndToEnd:
         assert "SHOULD NOT REACH" not in result.stdout
         assert "BLOCKED=4" in result.stdout
         assert not (workspace / ".pyddock:pwned").exists()
+
+
+class TestFsTOCTOU:
+    """Path-resolution TOCTOU: a path arg must be resolved once and that exact
+    value used by both the check and the syscall.
+
+    Name-patch layer: open-family functions materialize the path once and
+    forward the frozen value (closing the old check-via-Path(file) /
+    use-via-open(file) double resolution). Audit layer: needs no special
+    handling — every fs audit event already carries the single resolved value
+    the syscall uses (see _enforce_fs), so the backstop checks the true target.
+    """
+
+    def _exec(self, workspace: Path, venv_manager: VenvManager, source: str):
+        # Build an explicit config WITH an [audit] table so the audit backstop
+        # is actually installed (mirrors test_audit_hook_backstop.py). A config
+        # without [audit] installs no audit hook, which would make the
+        # leaked-FileIO backstop tests pass vacuously.
+        config = PyddockConfig(
+            execution=ExecutionConfig(timeout=30.0),
+            imports=ImportsConfig(allowed=["pathlib", "io", "sys", "os", "types"]),
+            filesystem=FilesystemConfig(writable_paths=["."], readable_paths=["*"]),
+            ast=ASTConfig(
+                block_calls=["eval", "exec", "compile", "breakpoint", "__import__"],
+                block_attributes=["__subclasses__", "__globals__"],
+            ),
+            restrictions={},
+            audit=AuditConfig(rules=[
+                ("open", "fs"),
+                ("os.rename", "fs-write-pair"), ("os.link", "fs-write-pair"),
+                ("os.symlink", "fs-write-pair"),
+                ("os.remove", "fs-write"), ("os.unlink", "fs-write"),
+                ("os.mkdir", "fs-write"), ("os.rmdir", "fs-write"),
+                ("os.chmod", "fs-write"), ("os.truncate", "fs-write"),
+            ]),
+        )
+        return SubprocessExecutor(config, venv_manager).execute(source, [], 10, workspace)
+
+    def test_fspath_returning_protected_is_blocked(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """A __fspath__ that yields the protected path is caught (the check sees
+        the real resolved value)."""
+        src = (
+            "class P:\n"
+            "    def __fspath__(self):\n"
+            "        return '.pyddock/pwned.txt'\n"
+            "try:\n"
+            "    open(P(), 'w').write('x')\n"
+            "    print('SHOULD NOT REACH')\n"
+            "except PermissionError as e:\n"
+            "    print('BLOCKED')\n"
+        )
+        result = self._exec(workspace, venv_manager, src)
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED" in result.stdout
+        assert "SHOULD NOT REACH" not in result.stdout
+        assert not (workspace / ".pyddock" / "pwned.txt").exists()
+
+    def test_call_counting_fspath_cannot_swap_to_protected(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """A __fspath__ that returns a benign path first and the protected path
+        on later calls cannot land a write in .pyddock: the value is resolved
+        once and that same value is what the kernel opens."""
+        (workspace / ".pyddock").mkdir(exist_ok=True)
+        src = (
+            "class P:\n"
+            "    def __init__(self): self.n = 0\n"
+            "    def __fspath__(self):\n"
+            "        self.n += 1\n"
+            "        return 'benign_target.txt' if self.n == 1 else '.pyddock/pwned.txt'\n"
+            "p = P()\n"
+            "open(p, 'w').write('data')\n"
+            "import pathlib\n"
+            "print('benign_exists=', pathlib.Path('benign_target.txt').exists())\n"
+            "print('pyddock_exists=', pathlib.Path('.pyddock/pwned.txt').exists())\n"
+        )
+        result = self._exec(workspace, venv_manager, src)
+        assert result.exit_code == 0, result.stderr
+        # The kernel opened the checked (benign) value, not the swapped one.
+        assert "benign_exists= True" in result.stdout
+        assert "pyddock_exists= False" in result.stdout
+        assert not (workspace / ".pyddock" / "pwned.txt").exists()
+
+    def test_bytearray_path_rejected(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """A mutable path buffer (bytearray) is rejected outright."""
+        src = (
+            "try:\n"
+            "    open(bytearray(b'x.txt'), 'w').write('x')\n"
+            "    print('SHOULD NOT REACH')\n"
+            "except PermissionError as e:\n"
+            "    print('BLOCKED:', 'mutable' in str(e))\n"
+        )
+        result = self._exec(workspace, venv_manager, src)
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED: True" in result.stdout
+        assert "SHOULD NOT REACH" not in result.stdout
+
+    def test_audit_backstop_catches_leaked_fileio_protected(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """The audit backstop catches a leaked (C-created, unpatched) _io.FileIO
+        writing to a protected path. FileIO resolves __fspath__ once and raises
+        the 'open' event with that resolved string, so the hook checks the true
+        target — no name-patch materialization is involved on this path. The
+        real FileIO class is leaked via open().buffer.raw (the C open builds a
+        genuine _io.FileIO, not our _PatchedFileIO subclass)."""
+        (workspace / ".pyddock").mkdir(exist_ok=True)
+        src = (
+            "import pathlib\n"
+            "f = open('seed.txt', 'w')\n"
+            "RealFileIO = type(f.buffer.raw)\n"
+            "f.close()\n"
+            "class P:\n"
+            "    def __fspath__(self):\n"
+            "        return '.pyddock/pwned.txt'\n"
+            "try:\n"
+            "    RealFileIO(P(), 'w')\n"
+            "    print('SHOULD NOT REACH')\n"
+            "except PermissionError:\n"
+            "    print('BLOCKED')\n"
+            "print('pyddock_exists=', pathlib.Path('.pyddock/pwned.txt').exists())\n"
+        )
+        result = self._exec(workspace, venv_manager, src)
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED" in result.stdout
+        assert "SHOULD NOT REACH" not in result.stdout
+        assert "pyddock_exists= False" in result.stdout
+        assert not (workspace / ".pyddock" / "pwned.txt").exists()
+
+    def test_leaked_fileio_counting_fspath_cannot_reach_pyddock(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """A leaked FileIO with a call-counting __fspath__ (benign first,
+        protected later) can never land a write in .pyddock: FileIO resolves
+        once and both the syscall and the 'open' event observe that same
+        resolved value, so the check matches what is opened."""
+        (workspace / ".pyddock").mkdir(exist_ok=True)
+        src = (
+            "import pathlib\n"
+            "f = open('seed.txt', 'w')\n"
+            "RealFileIO = type(f.buffer.raw)\n"
+            "f.close()\n"
+            "class P:\n"
+            "    def __init__(self): self.n = 0\n"
+            "    def __fspath__(self):\n"
+            "        self.n += 1\n"
+            "        return 'benign.txt' if self.n == 1 else '.pyddock/pwned.txt'\n"
+            "try:\n"
+            "    RealFileIO(P(), 'w')\n"
+            "    print('opened')\n"
+            "except PermissionError:\n"
+            "    print('blocked')\n"
+            "print('pyddock_exists=', pathlib.Path('.pyddock/pwned.txt').exists())\n"
+        )
+        result = self._exec(workspace, venv_manager, src)
+        assert result.exit_code == 0, result.stderr
+        # Either outcome is safe; the invariant is the protected file is never made.
+        assert "pyddock_exists= False" in result.stdout
+        assert not (workspace / ".pyddock" / "pwned.txt").exists()
+
+    def test_os_proxy_mkdir_resolves_once(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """The os proxy (makedirs/mkdir/chmod) resolves a path-like once and
+        forwards that frozen value, so a __fspath__ targeting a protected dir is
+        caught and a mutable buffer is rejected."""
+        (workspace / ".pyddock").mkdir(exist_ok=True)
+        src = (
+            "import os, pathlib\n"
+            "class P:\n"
+            "    def __fspath__(self): return '.pyddock/evil_dir'\n"
+            "try:\n"
+            "    os.makedirs(P())\n"
+            "    print('SHOULD NOT REACH')\n"
+            "except PermissionError:\n"
+            "    print('BLOCKED_PATHLIKE')\n"
+            "try:\n"
+            "    os.mkdir(bytearray(b'd'))\n"
+            "    print('SHOULD NOT REACH 2')\n"
+            "except PermissionError as e:\n"
+            "    print('BLOCKED_BYTEARRAY:', 'mutable' in str(e))\n"
+            "print('evil_exists=', pathlib.Path('.pyddock/evil_dir').exists())\n"
+        )
+        result = self._exec(workspace, venv_manager, src)
+        assert result.exit_code == 0, result.stderr
+        assert "BLOCKED_PATHLIKE" in result.stdout
+        assert "BLOCKED_BYTEARRAY: True" in result.stdout
+        assert "SHOULD NOT REACH" not in result.stdout
+        assert "evil_exists= False" in result.stdout
+        assert not (workspace / ".pyddock" / "evil_dir").exists()
+
+    def test_genuine_pathlib_still_works(
+        self, workspace: Path, venv_manager: VenvManager
+    ) -> None:
+        """Regression guard: a genuine pathlib.Path write/read still works."""
+        src = (
+            "import pathlib\n"
+            "p = pathlib.Path('ok.txt')\n"
+            "p.write_text('hello')\n"
+            "print('roundtrip=', p.read_text())\n"
+            "print('via_open=', open(pathlib.Path('ok.txt')).read())\n"
+        )
+        result = self._exec(workspace, venv_manager, src)
+        assert result.exit_code == 0, result.stderr
+        assert "roundtrip= hello" in result.stdout
+        assert "via_open= hello" in result.stdout
 
 
 class TestAdsArgPathScanBlocked:

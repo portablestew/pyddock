@@ -239,6 +239,8 @@ def apply_filesystem_scoping(
 
     def _check_read(path: pathlib.Path) -> None:
         """Raise PermissionError if path is outside readable scope."""
+        if isinstance(path, bytes):
+            path = _real_os.fsdecode(path)
         if _is_null_device(path):
             return
         if has_ntfs_stream(path):
@@ -265,6 +267,8 @@ def apply_filesystem_scoping(
 
     def _check_write(path: pathlib.Path) -> None:
         """Raise PermissionError if path is outside writable scope."""
+        if isinstance(path, bytes):
+            path = _real_os.fsdecode(path)
         if _is_null_device(path):
             return
         if has_ntfs_stream(path):
@@ -352,18 +356,58 @@ def apply_filesystem_scoping(
         # Any mode containing w, a, x, or + (except bare r) is a write mode
         return any(c in mode for c in "wax+")
 
+    def _materialize_pathlike(file: Any) -> Any:
+        """Resolve a path argument to a frozen str/bytes exactly once (TOCTOU).
+
+        The patched open-family functions previously checked ``Path(file)`` and
+        then handed the ORIGINAL ``file`` object to the real primitive — two
+        independent resolutions. A path-like object with a call-counting
+        ``__fspath__`` (or a mutable ``bytearray``/``memoryview`` buffer) can
+        return a benign value to the check and the protected value to the real
+        open. We close that by resolving ONCE here and forcing callers to pass
+        the returned value to BOTH the check and the real primitive, so the
+        kernel sees exactly what was validated.
+
+        - ``str``/``bytes`` (incl. subclasses): immutable content — returned as-is.
+        - ``bytearray``/``memoryview``: mutable buffer — rejected (a concurrent
+          thread could flip it between check and syscall).
+        - ``os.PathLike`` (incl. pathlib.Path and any subclass): ``os.fspath`` is
+          invoked exactly once; the result must be ``str``/``bytes``.
+        Non-path-like objects fall through to ``os.fspath`` which raises the same
+        ``TypeError`` the real open would.
+        """
+        if isinstance(file, (str, bytes)):
+            return file
+        if isinstance(file, (bytearray, memoryview)):
+            raise PermissionError(
+                "PermissionError: a mutable path buffer (bytearray/memoryview) "
+                "is not permitted as a file path — its contents can change "
+                "between the security check and the open (TOCTOU). Pass a str "
+                "or bytes path."
+            )
+        name = _real_os.fspath(file)  # single __fspath__ call
+        if not isinstance(name, (str, bytes)) or isinstance(name, (bytearray, memoryview)):
+            raise PermissionError(
+                "PermissionError: __fspath__ must return a str or bytes path."
+            )
+        return name
+
     # Patch builtins.open
     _ORIGINALS["builtins.open"] = builtins.open
 
     def _patched_open(
         file: Any, mode: str = "r", *args: Any, **kwargs: Any
     ) -> Any:
-        path = pathlib.Path(file) if not isinstance(file, pathlib.Path) else file
+        # Integer file descriptors are already-open handles — no path to check.
+        if isinstance(file, int):
+            return _ORIGINALS["builtins.open"](file, mode, *args, **kwargs)
+        name = _materialize_pathlike(file)  # resolve once
         if _is_write_mode(mode):
-            _check_write(path)
+            _check_write(name)
         else:
-            _check_read(path)
-        return _ORIGINALS["builtins.open"](file, mode, *args, **kwargs)
+            _check_read(name)
+        # Forward the FROZEN value, never the original object.
+        return _ORIGINALS["builtins.open"](name, mode, *args, **kwargs)
 
     builtins.open = _patched_open
 
@@ -527,12 +571,12 @@ def apply_filesystem_scoping(
         # Skip path checking for integer file descriptors (used internally by subprocess)
         if isinstance(file, int):
             return _ORIGINALS["io.open"](file, mode, *args, **kwargs)
-        path = pathlib.Path(file) if not isinstance(file, pathlib.Path) else file
+        name = _materialize_pathlike(file)  # resolve once
         if _is_write_mode(mode):
-            _check_write(path)
+            _check_write(name)
         else:
-            _check_read(path)
-        return _ORIGINALS["io.open"](file, mode, *args, **kwargs)
+            _check_read(name)
+        return _ORIGINALS["io.open"](name, mode, *args, **kwargs)
 
     _io_module.open = _patched_io_open
 
@@ -550,12 +594,12 @@ def apply_filesystem_scoping(
         caller = sys._getframe(1)
         if caller and caller.f_code.co_filename.startswith("<frozen"):
             return _ORIGINALS["_io.open"](file, mode, *args, **kwargs)
-        path = pathlib.Path(file) if not isinstance(file, pathlib.Path) else file
+        name = _materialize_pathlike(file)  # resolve once
         if _is_write_mode(mode):
-            _check_write(path)
+            _check_write(name)
         else:
-            _check_read(path)
-        return _ORIGINALS["_io.open"](file, mode, *args, **kwargs)
+            _check_read(name)
+        return _ORIGINALS["_io.open"](name, mode, *args, **kwargs)
 
     _cio_module.open = _patched_cio_open
 
@@ -568,13 +612,16 @@ def apply_filesystem_scoping(
         """FileIO subclass that enforces filesystem scoping on construction."""
 
         def __init__(self, file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> None:
-            if not isinstance(file, int):
-                path = pathlib.Path(file) if not isinstance(file, pathlib.Path) else file
-                if _is_write_mode(mode):
-                    _check_write(path)
-                else:
-                    _check_read(path)
-            super().__init__(file, mode, *args, **kwargs)
+            if isinstance(file, int):
+                super().__init__(file, mode, *args, **kwargs)
+                return
+            name = _materialize_pathlike(file)  # resolve once
+            if _is_write_mode(mode):
+                _check_write(name)
+            else:
+                _check_read(name)
+            # Construct with the FROZEN value, never the original object.
+            super().__init__(name, mode, *args, **kwargs)
 
     _io_module.FileIO = _PatchedFileIO
     _cio_module.FileIO = _PatchedFileIO
@@ -620,14 +667,19 @@ def apply_filesystem_scoping(
 
     # Patch os.makedirs and os.mkdir on the safe os proxy to use _check_write.
     # This ensures .pyddock/, workspace module dirs, and other protected paths
-    # are enforced (not just the workspace boundary check).
+    # are enforced (not just the workspace boundary check). Each resolves the
+    # path-like ONCE (_materialize_pathlike) and forwards that frozen value to
+    # the real call, so the check and the syscall can't see different paths
+    # (the same TOCTOU defense as the open family).
 
-    def _safe_makedirs(name: str, mode: int = 0o777, exist_ok: bool = False) -> None:
-        _check_write(pathlib.Path(name))
+    def _safe_makedirs(name: Any, mode: int = 0o777, exist_ok: bool = False) -> None:
+        name = _materialize_pathlike(name)
+        _check_write(name)
         _real_os.makedirs(name, mode, exist_ok=exist_ok)
 
-    def _safe_mkdir(name: str, mode: int = 0o777) -> None:
-        _check_write(pathlib.Path(name))
+    def _safe_mkdir(name: Any, mode: int = 0o777) -> None:
+        name = _materialize_pathlike(name)
+        _check_write(name)
         _real_os.mkdir(name, mode)
 
     if "os" in sys.modules:
@@ -636,9 +688,10 @@ def apply_filesystem_scoping(
         safe_os.mkdir = _safe_mkdir
 
     # Expose os.chmod with the same validation as Path.chmod.
-    def _safe_chmod(path: str, mode: int) -> None:
+    def _safe_chmod(path: Any, mode: int) -> None:
         _validate_chmod(mode, "os.chmod()")
-        _check_write(pathlib.Path(path))
+        path = _materialize_pathlike(path)
+        _check_write(path)
         _real_os.chmod(path, mode)
 
     if "os" in sys.modules:
