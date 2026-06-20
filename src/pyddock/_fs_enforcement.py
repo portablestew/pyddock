@@ -14,7 +14,7 @@ import tempfile as _tempfile_module
 import _io as _cio_module
 from typing import Any
 
-from pyddock._base import _ORIGINALS, _PYDDOCK_DIR, _find_deny_hint, canonical_path
+from pyddock._base import _ORIGINALS, _PYDDOCK_DIR, _find_deny_hint, canonical_path, has_ntfs_stream
 from pyddock._import_hook import _caller_is_trusted
 from pyddock._audit_enforcement import install_audit_enforcement
 from pyddock._process_utils import make_child_env
@@ -241,6 +241,12 @@ def apply_filesystem_scoping(
         """Raise PermissionError if path is outside readable scope."""
         if _is_null_device(path):
             return
+        if has_ntfs_stream(path):
+            raise PermissionError(
+                f"PermissionError: Cannot read '{path}' — NTFS alternate data "
+                f"streams (':' in a path component) are not permitted. Use a "
+                f"standard file path."
+            )
         resolved = _abspath(path)
         # Check guards first (first match wins)
         guard_result = _check_guard(resolved, "read")
@@ -261,6 +267,14 @@ def apply_filesystem_scoping(
         """Raise PermissionError if path is outside writable scope."""
         if _is_null_device(path):
             return
+        if has_ntfs_stream(path):
+            raise PermissionError(
+                f"PermissionError: Cannot write to '{path}' — NTFS alternate "
+                f"data streams (':' in a path component) are not permitted. A "
+                f"stream reference can address a protected object (e.g. "
+                f"'.pyddock:x' writes onto the .pyddock directory). Use a "
+                f"standard file path."
+            )
         resolved = _abspath(path)
         # Check guards first (first match wins)
         guard_result = _check_guard(resolved, "write")

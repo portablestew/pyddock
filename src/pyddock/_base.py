@@ -25,6 +25,7 @@ _PYDDOCK_DIR = _os_for_path.path.dirname(_os_for_path.path.abspath(__file__))
 _normcase = _os_for_path.path.normcase
 _realpath = _os_for_path.path.realpath
 _abspath = _os_for_path.path.abspath
+_os_name = _os_for_path.name
 del _os_for_path
 
 # Module-level dict for storing original (unpatched) function references.
@@ -33,6 +34,38 @@ del _os_for_path
 # function.__closure__[N].cell_contents or descriptor-protocol introspection.
 # Since pyddock._* modules are not importable by agent code, this dict is inaccessible.
 _ORIGINALS: dict[str, Any] = {}
+
+
+def has_ntfs_stream(path: Any) -> bool:
+    """Detect an NTFS alternate-data-stream (ADS) reference in a path.
+
+    On Windows, ``name:stream`` (and ``name::$DATA``, ``dir:stream``) addresses a
+    *different* securable object than the path's lexical components imply: a write
+    to ``.pyddock:pwned`` lands a data stream on the ``.pyddock`` directory, yet
+    the lexical leaf ``.pyddock:pwned`` is not a child of ``.pyddock`` — so a
+    ``relative_to('.pyddock')`` containment check decides "not protected" and the
+    write slips through. ``realpath`` does not reliably normalize the stream away
+    (a not-yet-existing stream resolves to the literal), so the only sound defense
+    is to reject the syntax up front.
+
+    A ``:`` is only legal as the drive designator at index 1 of the FIRST path
+    component (``C:\\...`` or the drive-relative ``C:rest``). A ``:`` anywhere else
+    is a stream reference. Returns False on non-Windows, where ``:`` is an
+    ordinary, legal filename character.
+    """
+    if _os_name != "nt":
+        return False
+    parts = str(path).replace("/", "\\").split("\\")
+    for idx, comp in enumerate(parts):
+        if not comp:
+            continue
+        start = 0
+        # First component may carry a 'X:' drive designator (X: or X:rest).
+        if idx == 0 and len(comp) >= 2 and comp[0].isalpha() and comp[1] == ":":
+            start = 2
+        if ":" in comp[start:]:
+            return True
+    return False
 
 
 def canonical_path(path: Any) -> pathlib.Path:

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from pyddock.config import PyddockConfig, ShellPolicyConfig, find_deny_hint
-from pyddock._base import canonical_path
+from pyddock._base import canonical_path, has_ntfs_stream
 from pyddock._process_utils import get_startupinfo, kill_and_drain, make_child_env, truncate_output
 
 import shutil
@@ -55,29 +55,27 @@ def _looks_like_path(arg: str) -> bool:
 
 
 def _extract_path_candidates(arg: str) -> list[str]:
-    """Extract all path-like substrings from an argument.
+    """Return the filesystem path(s) a single CLI argument will operate on.
 
-    Handles --flag=value and -flag=value patterns where the value portion
-    may be a filesystem path that the command will write to. This prevents
-    bypasses like --output=.pyddock/file where the scanner would otherwise
-    treat the entire "--output=.pyddock/file" as a single (non-matching) path.
+    For a switch with an attached value (``--flag=value``, ``-flag=value``,
+    ``-o=value``), the path the command acts on is the VALUE — so we parse it
+    out and return only that. The raw ``--flag=value`` token is deliberately NOT
+    returned as a path candidate: lexically it is not the path (it resolves to a
+    bogus in-workspace name like ``<ws>/--output=C:/...`` that always passes the
+    containment check, giving false confidence), and its embedded ``=C:`` drive
+    colon trips path/stream heuristics (false positives). Space-separated value
+    forms (``--output value``) need no special handling here — ``value`` arrives
+    as its own argument and is scanned on the next iteration.
 
-    Returns a list of path candidates to check. Always includes the raw arg
-    itself if it looks like a path, plus any extracted value portions.
+    Returns an empty list when nothing path-like is present.
     """
-    candidates: list[str] = []
-
-    # Always check the raw arg
-    if _looks_like_path(arg):
-        candidates.append(arg)
-
-    # Extract value from --flag=value or -flag=value patterns
+    # Switch with an attached value: parse out the value, check only it.
     if arg.startswith("-") and "=" in arg:
         _, _, value = arg.partition("=")
-        if value and _looks_like_path(value):
-            candidates.append(value)
+        return [value] if value and _looks_like_path(value) else []
 
-    return candidates
+    # Bare argument: the argument itself is the path candidate.
+    return [arg] if _looks_like_path(arg) else []
 
 
 def resolve_command(command: str) -> list[str]:
@@ -482,6 +480,14 @@ def evaluate_arg_paths(
             continue
 
         for candidate in candidates:
+            # NTFS alternate data streams alias a different object than their
+            # lexical path implies (e.g. "--output=.pyddock:x" writes onto the
+            # protected .pyddock dir while evading the relative_to() check).
+            if has_ntfs_stream(candidate):
+                return (
+                    f"Argument '{arg}' uses an NTFS alternate data stream "
+                    f"(':' in a path component), which is not permitted."
+                )
             # Resolve relative to workspace root (same as command cwd)
             resolved = _abspath(workspace_root / candidate)
 
@@ -560,6 +566,11 @@ def evaluate_cwd(
         return None
 
     cwd_str = cwd.decode("utf-8", "surrogateescape") if isinstance(cwd, bytes) else str(cwd)
+    if has_ntfs_stream(cwd_str):
+        return (
+            f"cwd '{cwd_str}' uses an NTFS alternate data stream (':' in a path "
+            f"component), which is not permitted."
+        )
     ws_root_abs = _abspath(workspace_root)
     pyddock_dir = _abspath(workspace_root / ".pyddock")
     resolved = _abspath(workspace_root / Path(cwd_str))

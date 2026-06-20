@@ -332,7 +332,19 @@ mode = "deny"
 # upload/receive-pack hooks (local RCE), regardless of the allow-list below.
 # Also blocks config/command-injection globals that, if injected before the
 # subcommand, enable arbitrary code execution (-c core.sshCommand=..., etc.).
-deny = ["ext::", "--upload-pack", "--receive-pack", "^-c(\\s|$)", "--config-env", "--exec-path"]
+deny = [
+    "ext::", "--upload-pack", "--receive-pack", "^-c(\\s|$)",
+    "--config-env", "--exec-path",
+    # rebase/push/fetch --exec: runs an arbitrary per-commit shell command
+    # (git rebase -x/--exec) and is also the documented synonym for
+    # --receive-pack (push) / --upload-pack (fetch). No legitimate sandbox use —
+    # safe to deny in every subcommand. Does NOT match --exec-path (above).
+    "--exec(\\s|=|$)",
+    # rebase short form: git rebase -x <cmd> (and "git pull --rebase ... -x").
+    # Scoped to the rebase token via re.search so it does NOT clobber the
+    # unrelated, legitimate "git clean -x" (remove ignored files).
+    "\\brebase\\b.*\\s-x(\\s|$)",
+]
 allow = [
     # Read-only queries
     "status(\\s|$)", "log(\\s|$)", "diff(\\s|$)", "show(\\s|$)", "rev-parse(\\s|$)",
