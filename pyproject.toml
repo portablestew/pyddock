@@ -1,6 +1,6 @@
 [project]
 name = "pyddock"
-version = "0.3.1"
+version = "0.3.2"
 description = "MCP server that gives AI agents pre-approved Python, shell, and file I/O tools with declarative policy controls"
 requires-python = ">=3.11"
 license = "MIT"

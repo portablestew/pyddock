@@ -52,6 +52,14 @@ def has_ntfs_stream(path: Any) -> bool:
     component (``C:\\...`` or the drive-relative ``C:rest``). A ``:`` anywhere else
     is a stream reference. Returns False on non-Windows, where ``:`` is an
     ordinary, legal filename character.
+
+    NOTE: this primitive is deliberately strict and makes NO exception for
+    URL-looking strings (``https://...``). It guards real filesystem operations
+    (``open``/``Path.write_*``), where the argument is always a local path and a
+    ``scheme:`` prefix would still carry a stream-bearing ``:``. The one place a
+    URL is a legitimate value — a shell CLI argument — filters URLs out *before*
+    they reach this check (see ``_looks_like_path`` in shell_executor), so URLs
+    never get here in the first place.
     """
     if _os_name != "nt":
         return False

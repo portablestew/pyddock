@@ -21,6 +21,13 @@ from pyddock._process_utils import get_startupinfo, kill_and_drain, make_child_e
 import shutil
 
 
+# A scheme://… URI prefix (http://, https://, ssh://, ftp://, …). Used to keep
+# URLs from being treated as local filesystem path candidates in shell args.
+# Matches RFC-3986 scheme syntax: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+# followed by "://".
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
 def _abspath(p: Path) -> Path:
     """Canonicalize a path for shell-arg containment checks.
 
@@ -39,8 +46,19 @@ def _looks_like_path(arg: str) -> bool:
     Returns True if the arg contains path separators, starts with '.',
     or starts with a drive letter (Windows). Excludes UNC-style paths
     (//server/...) and Perforce depot paths (//depot/...) which are not
-    local filesystem targets.
+    local filesystem targets, and ``scheme://...`` URLs (http, https, ssh,
+    ftp, ...), which are likewise not local paths.
+
+    The URL exclusion is also what keeps a URL argument from reaching
+    `has_ntfs_stream`: a URL's ``scheme:`` prefix (and any ``host:port``)
+    carries colons that the strict stream check would otherwise reject as an
+    NTFS alternate-data-stream reference (false positive). Filtering URLs out
+    here — rather than relaxing `has_ntfs_stream` itself — keeps that primitive
+    strict for the real filesystem operations that depend on it.
     """
+    # Exclude scheme://... URLs (http, https, ssh, ftp, ...) — not local paths.
+    if _URL_SCHEME_RE.match(arg):
+        return False
     # Exclude //... paths (UNC paths, Perforce depot paths)
     if arg.startswith("//"):
         return False

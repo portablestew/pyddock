@@ -144,6 +144,74 @@ class TestHasNtfsStream:
         assert has_ntfs_stream("C:relative\\file") is False
         assert has_ntfs_stream("C:\\abs\\file") is False
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="NTFS ADS is Windows-only")
+    def test_primitive_stays_strict_for_url_disguised_stream(self) -> None:
+        # has_ntfs_stream is a low-level filesystem primitive: it must NOT make
+        # an exception for URL-looking strings. A scheme:// prefix slapped onto a
+        # stream-bearing path (e.g. open("https://.pyddock:pwned", "w")) resolves
+        # to an in-workspace lexical path and would otherwise slip past the
+        # writable_paths containment check. The primitive must still reject it;
+        # URL filtering belongs to the shell-arg layer (_looks_like_path), not
+        # here. See the matching regression in TestUrlArgsNotPathCandidates.
+        assert has_ntfs_stream("https://.pyddock:pwned") is True
+        assert has_ntfs_stream("http://host/file.txt:stream") is True
+
+
+class TestUrlArgsNotPathCandidates:
+    """URLs passed as shell CLI arguments must not be treated as local paths.
+
+    Regression: a URL argument (e.g. `-Url https://host/a/b`) tripped the
+    NTFS-stream check because the scheme's `:` (and any `host:port`) looked like
+    an alternate-data-stream reference. URLs are filtered out at the
+    `_looks_like_path` layer so they never reach the stream check, while the
+    primitive itself stays strict for real filesystem paths.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.example.com/projects/abc/designs/xyz",
+            "http://example.com/path",
+            "https://host:8443/path",  # host:port colon
+            "ssh://git@github.com/org/repo.git",
+            "ftp://files.example.com/data.txt",
+        ],
+    )
+    def test_urls_are_not_path_candidates(self, url: str) -> None:
+        from pyddock.shell_executor import _extract_path_candidates, _looks_like_path
+
+        assert _looks_like_path(url) is False, url
+        assert _extract_path_candidates(url) == [], url
+
+    def test_url_arg_passes_arg_path_scan(self, tmp_path: Path) -> None:
+        # A URL argument must not be rejected by the arg-path scanner in either
+        # "protected" or "workspace" mode.
+        for mode in ("protected", "workspace"):
+            reason = evaluate_arg_paths(
+                ["-Url", "https://api.example.com/projects/abc/designs/xyz", "-Raw"],
+                arg_paths=mode,
+                workspace_root=tmp_path,
+                workspace_module_dirs={},
+                shell_command_patterns=[],
+            )
+            assert reason is None, (mode, reason)
+
+    def test_stream_in_flag_value_still_blocked(self, tmp_path: Path) -> None:
+        # The URL exclusion must NOT weaken the output-flag stream attack: a
+        # value that is a stream-bearing path (not a scheme://) is still scanned.
+        reason = evaluate_arg_paths(
+            ["-o=.pyddock:pwned"],
+            arg_paths="protected",
+            workspace_root=tmp_path,
+            workspace_module_dirs={},
+            shell_command_patterns=[],
+        )
+        if sys.platform == "win32":
+            assert reason is not None and "alternate data stream" in reason
+        else:
+            # NTFS ADS is Windows-only; on POSIX ':' is a legal filename char.
+            assert reason is None or "alternate data stream" not in reason
+
 
 class TestAdsWriteBlockedEndToEnd:
     @pytest.mark.skipif(sys.platform != "win32", reason="NTFS ADS is Windows-only")
