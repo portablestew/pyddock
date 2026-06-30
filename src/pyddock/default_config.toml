@@ -69,7 +69,9 @@ P4 = "p4python" # Restricted to non-submit operations
 # Filesystem scoping for run_python.
 # Paths are relative to the workspace root (the --workspace directory or CWD).
 #   "."  = the workspace directory itself (and everything under it)
+#   "~"  = user home directory (os.path.expanduser); "~/subdir" works too
 #   "*"  = unrestricted (entire host filesystem)
+# Absolute paths (e.g. "C:\\Data") are also accepted and used as-is.
 # Writes are always denied to .pyddock/ (self-modification protection) and to
 # paths matching shell-executable script patterns (write-then-execute prevention).
 [filesystem]

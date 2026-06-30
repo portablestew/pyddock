@@ -14,7 +14,7 @@ import tempfile as _tempfile_module
 import _io as _cio_module
 from typing import Any
 
-from pyddock._base import _ORIGINALS, _PYDDOCK_DIR, _find_deny_hint, canonical_path, has_ntfs_stream
+from pyddock._base import _ORIGINALS, _PYDDOCK_DIR, _find_deny_hint, canonical_path, ntfs_stream_base
 from pyddock._import_hook import _caller_is_trusted
 from pyddock._audit_enforcement import install_audit_enforcement
 from pyddock._process_utils import make_child_env
@@ -54,16 +54,30 @@ def apply_filesystem_scoping(
         """
         return canonical_path(p)
 
+    def _resolve_scope_path(p: str) -> pathlib.Path:
+        """Resolve a scope path entry to an absolute, canonicalized path.
+
+        Supports:
+          - "~" or "~/..." — expanded via os.path.expanduser
+          - Absolute paths (e.g. "C:\\Users\\...") — used as-is
+          - Relative paths (e.g. ".", "src") — joined with workspace_root
+        """
+        expanded = _real_os.path.expanduser(p)
+        path = pathlib.Path(expanded)
+        if path.is_absolute():
+            return _abspath(path)
+        return _abspath(workspace_root / expanded)
+
     # Canonicalize allowed paths (realpath: resolves symlinks/junctions/8.3
     # names) so they compare consistently with canonicalized candidate paths.
     resolved_writable = [
-        _abspath(workspace_root / p) for p in writable_paths
+        _resolve_scope_path(p) for p in writable_paths
     ]
 
     # "*" means unrestricted reads
     unrestricted_reads = "*" in readable_paths
     resolved_readable = [
-        _abspath(workspace_root / p) for p in readable_paths if p != "*"
+        _resolve_scope_path(p) for p in readable_paths if p != "*"
     ]
 
     # .pyddock/ is always excluded from writes (self-modification protection)
@@ -243,7 +257,12 @@ def apply_filesystem_scoping(
             path = _real_os.fsdecode(path)
         if _is_null_device(path):
             return
-        if has_ntfs_stream(path):
+        # NTFS alternate data stream whose base object EXISTS — aliasing a
+        # stream onto an existing (often protected) object evades containment
+        # checks. Gated on existence to avoid false positives on colon-bearing
+        # strings whose base does not exist.
+        _stream_base = ntfs_stream_base(path)
+        if _stream_base is not None and _real_os.path.exists(_stream_base):
             raise PermissionError(
                 f"PermissionError: Cannot read '{path}' — NTFS alternate data "
                 f"streams (':' in a path component) are not permitted. Use a "
@@ -271,7 +290,11 @@ def apply_filesystem_scoping(
             path = _real_os.fsdecode(path)
         if _is_null_device(path):
             return
-        if has_ntfs_stream(path):
+        # NTFS alternate data stream whose base object EXISTS (see _check_read).
+        # The base of '.pyddock:x' is '.pyddock' (always present) — caught; a
+        # colon in a non-existent-base string is not a real stream reference.
+        _stream_base = ntfs_stream_base(path)
+        if _stream_base is not None and _real_os.path.exists(_stream_base):
             raise PermissionError(
                 f"PermissionError: Cannot write to '{path}' — NTFS alternate "
                 f"data streams (':' in a path component) are not permitted. A "
