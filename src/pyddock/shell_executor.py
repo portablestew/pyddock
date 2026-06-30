@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from pyddock.config import PyddockConfig, ShellPolicyConfig, find_deny_hint
-from pyddock._base import canonical_path, has_ntfs_stream
+from pyddock._base import canonical_path, ntfs_stream_base
 from pyddock._process_utils import get_startupinfo, kill_and_drain, make_child_env, truncate_output
 
 import shutil
@@ -501,11 +501,18 @@ def evaluate_arg_paths(
             # NTFS alternate data streams alias a different object than their
             # lexical path implies (e.g. "--output=.pyddock:x" writes onto the
             # protected .pyddock dir while evading the relative_to() check).
-            if has_ntfs_stream(candidate):
-                return (
-                    f"Argument '{arg}' uses an NTFS alternate data stream "
-                    f"(':' in a path component), which is not permitted."
-                )
+            # Gated on existence of the base object: protected targets always
+            # exist, so the attack is still caught, while a colon in a value
+            # whose base does not exist is not treated as a stream.
+            _stream_base = ntfs_stream_base(candidate)
+            if _stream_base is not None:
+                _base_p = Path(_stream_base)
+                _base_abs = _base_p if _base_p.is_absolute() else workspace_root / _base_p
+                if _base_abs.exists():
+                    return (
+                        f"Argument '{arg}' uses an NTFS alternate data stream "
+                        f"(':' in a path component), which is not permitted."
+                    )
             # Resolve relative to workspace root (same as command cwd)
             resolved = _abspath(workspace_root / candidate)
 
@@ -584,11 +591,15 @@ def evaluate_cwd(
         return None
 
     cwd_str = cwd.decode("utf-8", "surrogateescape") if isinstance(cwd, bytes) else str(cwd)
-    if has_ntfs_stream(cwd_str):
-        return (
-            f"cwd '{cwd_str}' uses an NTFS alternate data stream (':' in a path "
-            f"component), which is not permitted."
-        )
+    _cwd_stream_base = ntfs_stream_base(cwd_str)
+    if _cwd_stream_base is not None:
+        _cwd_base_p = Path(_cwd_stream_base)
+        _cwd_base_abs = _cwd_base_p if _cwd_base_p.is_absolute() else workspace_root / _cwd_base_p
+        if _cwd_base_abs.exists():
+            return (
+                f"cwd '{cwd_str}' uses an NTFS alternate data stream (':' in a path "
+                f"component), which is not permitted."
+            )
     ws_root_abs = _abspath(workspace_root)
     pyddock_dir = _abspath(workspace_root / ".pyddock")
     resolved = _abspath(workspace_root / Path(cwd_str))

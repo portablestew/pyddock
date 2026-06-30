@@ -36,33 +36,39 @@ del _os_for_path
 _ORIGINALS: dict[str, Any] = {}
 
 
-def has_ntfs_stream(path: Any) -> bool:
-    """Detect an NTFS alternate-data-stream (ADS) reference in a path.
+def ntfs_stream_base(path: Any) -> str | None:
+    """Return the base path of an NTFS alternate-data-stream (ADS) reference.
 
     On Windows, ``name:stream`` (and ``name::$DATA``, ``dir:stream``) addresses a
     *different* securable object than the path's lexical components imply: a write
     to ``.pyddock:pwned`` lands a data stream on the ``.pyddock`` directory, yet
     the lexical leaf ``.pyddock:pwned`` is not a child of ``.pyddock`` — so a
     ``relative_to('.pyddock')`` containment check decides "not protected" and the
-    write slips through. ``realpath`` does not reliably normalize the stream away
-    (a not-yet-existing stream resolves to the literal), so the only sound defense
-    is to reject the syntax up front.
+    write slips through.
 
     A ``:`` is only legal as the drive designator at index 1 of the FIRST path
     component (``C:\\...`` or the drive-relative ``C:rest``). A ``:`` anywhere else
-    is a stream reference. Returns False on non-Windows, where ``:`` is an
+    opens a named stream on the component to its left. When such a reference is
+    present this returns the lexical BASE — everything up to (but not including)
+    the stream ``:`` — i.e. the object the stream would attach to. Returns None
+    when no stream reference is present, and on non-Windows, where ``:`` is an
     ordinary, legal filename character.
 
-    NOTE: this primitive is deliberately strict and makes NO exception for
-    URL-looking strings (``https://...``). It guards real filesystem operations
-    (``open``/``Path.write_*``), where the argument is always a local path and a
-    ``scheme:`` prefix would still carry a stream-bearing ``:``. The one place a
-    URL is a legitimate value — a shell CLI argument — filters URLs out *before*
-    they reach this check (see ``_looks_like_path`` in shell_executor), so URLs
-    never get here in the first place.
+    Callers existence-check the resolved base to decide whether the reference is
+    security-relevant: the ADS containment-evasion attack aliases a stream onto
+    an *existing* (and typically protected) object — ``.pyddock``, a workspace
+    module dir, the stdlib — all of which always exist on disk. A colon in a
+    string that merely looks path-like (e.g. a commit message) has a base that
+    does not exist, so it is not a real stream reference.
+
+    NOTE: this is purely lexical and makes NO exception for URL-looking strings
+    (``https://...``); a ``scheme:`` prefix still carries a stream-bearing ``:``.
+    The one place a URL is a legitimate value — a shell CLI argument — filters
+    URLs out *before* they reach this check (see ``_looks_like_path`` in
+    shell_executor), so URLs never get here in the first place.
     """
     if _os_name != "nt":
-        return False
+        return None
     parts = str(path).replace("/", "\\").split("\\")
     for idx, comp in enumerate(parts):
         if not comp:
@@ -71,9 +77,22 @@ def has_ntfs_stream(path: Any) -> bool:
         # First component may carry a 'X:' drive designator (X: or X:rest).
         if idx == 0 and len(comp) >= 2 and comp[0].isalpha() and comp[1] == ":":
             start = 2
-        if ":" in comp[start:]:
-            return True
-    return False
+        ci = comp.find(":", start)
+        if ci != -1:
+            base_parts = parts[:idx] + [comp[:ci]]
+            return "\\".join(base_parts)
+    return None
+
+
+def has_ntfs_stream(path: Any) -> bool:
+    """Pure-syntactic NTFS ADS detector — True if *path* carries a stream ``:``.
+
+    See ``ntfs_stream_base`` for the parsing rules. This is the lexical primitive
+    (existence-agnostic). Enforcement layers DO NOT call this directly: they
+    existence-gate via ``ntfs_stream_base`` so a colon in a non-path string does
+    not raise a false positive. Returns False on non-Windows.
+    """
+    return ntfs_stream_base(path) is not None
 
 
 def canonical_path(path: Any) -> pathlib.Path:

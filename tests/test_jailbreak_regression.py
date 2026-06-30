@@ -8,9 +8,13 @@
 2. NTFS alternate data streams — `open(".pyddock:pwned", "w")` writes a data
    stream onto the protected `.pyddock` directory while the lexical leaf
    `.pyddock:pwned` evades the `relative_to('.pyddock')` containment check.
-   Fixed by rejecting any path component carrying a `:` stream reference
-   (has_ntfs_stream), wired into the shared _check_read/_check_write closures
-   and the shell arg-path / cwd scanners.
+   Fixed by detecting a `:` stream reference and rejecting it when the stream's
+   BASE object exists on disk (ntfs_stream_base + an existence check), wired
+   into the shared _check_read/_check_write closures and the shell arg-path /
+   cwd scanners. The existence gate is sound because every protected target
+   (.pyddock, workspace module dirs, the stdlib) always exists, so the attack is
+   still blocked — while a colon in a string that merely looks path-like (e.g. a
+   commit message) has a non-existent base and is no longer a false positive.
 """
 
 from __future__ import annotations
@@ -139,6 +143,18 @@ class TestHasNtfsStream:
             assert has_ntfs_stream(bad) is True, bad
 
     @pytest.mark.skipif(sys.platform != "win32", reason="NTFS ADS is Windows-only")
+    def test_stream_base_extraction(self) -> None:
+        # ntfs_stream_base returns the object the stream attaches to (or None).
+        from pyddock._base import ntfs_stream_base
+
+        assert ntfs_stream_base(".pyddock:pwned") == ".pyddock"
+        assert ntfs_stream_base(".pyddock:pwned.txt") == ".pyddock"
+        assert ntfs_stream_base("C:/Git/pyddock/.pyddock:pwned") == "C:\\Git\\pyddock\\.pyddock"
+        assert ntfs_stream_base("dir/file.txt:s") == "dir\\file.txt"
+        assert ntfs_stream_base("file.txt") is None
+        assert ntfs_stream_base("C:\\abs\\file") is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="NTFS ADS is Windows-only")
     def test_drive_relative_not_flagged(self) -> None:
         # 'C:rest' (drive-relative) and 'C:\\...' are the only legal colons.
         assert has_ntfs_stream("C:relative\\file") is False
@@ -199,6 +215,7 @@ class TestUrlArgsNotPathCandidates:
     def test_stream_in_flag_value_still_blocked(self, tmp_path: Path) -> None:
         # The URL exclusion must NOT weaken the output-flag stream attack: a
         # value that is a stream-bearing path (not a scheme://) is still scanned.
+        (tmp_path / ".pyddock").mkdir()  # base object the stream targets
         reason = evaluate_arg_paths(
             ["-o=.pyddock:pwned"],
             arg_paths="protected",
@@ -220,6 +237,9 @@ class TestAdsWriteBlockedEndToEnd:
     ) -> None:
         """open('.pyddock:pwned', 'w') must be rejected — it would otherwise
         write a data stream onto the protected .pyddock directory."""
+        # The server always creates .pyddock at startup; mirror that here so the
+        # stream's base object exists (the existence gate keys off this).
+        (workspace / ".pyddock").mkdir(exist_ok=True)
         config = PyddockConfig(
             execution=ExecutionConfig(timeout=30.0),
             imports=ImportsConfig(allowed=["pathlib", "io"]),
@@ -471,6 +491,7 @@ class TestAdsArgPathScanBlocked:
     def test_shell_output_arg_with_stream_rejected(self, tmp_path: Path) -> None:
         """A shell arg like --output=.pyddock:x must be rejected by the arg
         scanner (same containment gap as the fs guard)."""
+        (tmp_path / ".pyddock").mkdir()  # base object the stream targets
         reason = evaluate_arg_paths(
             ["--output=.pyddock:pwned"],
             arg_paths="workspace",
@@ -506,3 +527,17 @@ class TestAdsArgPathScanBlocked:
             shell_command_patterns=["^git$"],
         )
         assert reason is None
+
+    def test_stream_value_with_nonexistent_base_allowed(self, tmp_path: Path) -> None:
+        """Existence gate (false-positive fix): a colon-bearing, path-like value
+        whose base object does NOT exist is not treated as a stream. This is what
+        keeps colons in non-path strings (e.g. a 'feat: ...' commit message that
+        happens to contain a '/') from being rejected as ADS references."""
+        reason = evaluate_arg_paths(
+            ["-o=notes:draft/today.txt"],
+            arg_paths="workspace",
+            workspace_root=tmp_path,
+            workspace_module_dirs={},
+            shell_command_patterns=[],
+        )
+        assert reason is None, reason
