@@ -4,6 +4,16 @@ Search file contents by regex (always case-insensitive). Approximately:
 fs_find() then re.search(grep_regex, line, re.IGNORECASE) per line of each
 matched file.
 
+grep_regex is searched within each file matched by file_glob (glob,
+default '*') or file_regex (mutually exclusive) under path (default:
+workspace root). Returns 'path:line: content' per match, capped at
+max_results (default: 100) and 300 chars per line. Optional
+max_results_per_file caps matches per file. Like file_glob, file_regex
+matches basenames at any depth unless it contains '/' (then it matches the
+full relative path); like grep_regex/exclude_regex, file_regex matches
+anywhere in the name/path (re.search), not just the whole thing — anchor
+with ^/$ for an exact match.
+
 Hidden dot-directories are pruned before descending (see fs_find); an
 optional exclude_regex prunes/excludes additional entries the same way. A
 file_glob whose final segment starts with '.' (e.g. '.env') explicitly
@@ -14,8 +24,11 @@ Binary files are skipped when scanning a directory path (sniffed from the
 same read used for matching — no separate open). A single named file is
 always searched, binary or not.
 
-max_results_per_file (optional) caps matches per individual file.
+context_lines controls how many surrounding lines are shown around each
+match. Default: 1 for directory scans, 4 for single-file targets. Set to 0
+for compact output with no context.
 """
+import glob as _glob
 import os
 import re
 import sys
@@ -23,11 +36,13 @@ from pathlib import Path
 
 # --- Parameters ---
 grep_regex = _PARAMS["grep_regex"]
-file_glob = _PARAMS.get("file_glob") or "*"
+file_glob = _PARAMS.get("file_glob")
+file_regex = _PARAMS.get("file_regex")
 path_str = _PARAMS.get("path") or "."
 exclude_regex = _PARAMS.get("exclude_regex")
 max_results = _PARAMS.get("max_results") or 100
 max_results_per_file = _PARAMS.get("max_results_per_file")
+context_lines = _PARAMS.get("context_lines")  # None = adaptive default
 workspace_root = _PARAMS["workspace_root"]
 
 # --- Constants ---
@@ -55,51 +70,6 @@ def display_path(p: Path) -> str:
         return str(rel).replace("\\", "/")
     except ValueError:
         return str(p)
-
-
-def translate_glob(pattern: str) -> str:
-    """Translate a glob pattern to an anchored regex.
-
-    Supports '*' (any run of non-separator chars), '?' (one non-separator
-    char), '[seq]'/'[!seq]' character classes, and '**' as a recursive
-    any-depth-of-segments wildcard. Matched against a forward-slash path.
-    """
-    i, n = 0, len(pattern)
-    out: list[str] = []
-    while i < n:
-        c = pattern[i]
-        i += 1
-        if c == "*":
-            if i < n and pattern[i] == "*":
-                i += 1
-                if i < n and pattern[i] == "/":
-                    i += 1
-                    out.append("(?:.*/)?")
-                else:
-                    out.append(".*")
-            else:
-                out.append("[^/]*")
-        elif c == "?":
-            out.append("[^/]")
-        elif c == "[":
-            j = i
-            if j < n and pattern[j] == "!":
-                j += 1
-            if j < n and pattern[j] == "]":
-                j += 1
-            while j < n and pattern[j] != "]":
-                j += 1
-            if j >= n:
-                out.append(re.escape("["))
-            else:
-                stuff = pattern[i:j]
-                if stuff.startswith("!"):
-                    stuff = "^" + stuff[1:]
-                out.append("[" + stuff + "]")
-                i = j + 1
-        else:
-            out.append(re.escape(c))
-    return "^" + "".join(out) + "$"
 
 
 def is_hidden(name: str) -> bool:
@@ -144,6 +114,59 @@ def read_text_or_skip_reason(p: Path) -> tuple[str | None, str | None]:
     return (chunk + rest).decode("utf-8", errors="replace"), None
 
 
+def format_matches_with_context(
+    lines: list[str], match_line_nums: list[int], label: str, ctx: int
+) -> list[str]:
+    """Format matched lines with surrounding context, merging overlapping groups.
+
+    Uses grep-style output:
+      path:linenum: matched line content
+      path-linenum- context line content
+    Groups of matches whose context windows overlap are merged and separated
+    from non-overlapping groups by a '--' line.
+
+    Args:
+        lines: All lines in the file (0-indexed list).
+        match_line_nums: 1-indexed line numbers that matched.
+        label: Display path prefix for each output line.
+        ctx: Number of context lines before and after each match.
+
+    Returns:
+        List of formatted output strings.
+    """
+    if not match_line_nums:
+        return []
+
+    total = len(lines)
+    output: list[str] = []
+
+    # Build merged groups of (start_0idx, end_0idx_exclusive, set_of_match_0idxs)
+    groups: list[tuple[int, int, set[int]]] = []
+    for ln in match_line_nums:
+        idx = ln - 1  # convert to 0-indexed
+        start = max(0, idx - ctx)
+        end = min(total, idx + ctx + 1)
+        if groups and start <= groups[-1][1]:
+            # Merge with previous group
+            prev_start, prev_end, prev_matches = groups[-1]
+            groups[-1] = (prev_start, max(prev_end, end), prev_matches | {idx})
+        else:
+            groups.append((start, end, {idx}))
+
+    for gi, (start, end, match_idxs) in enumerate(groups):
+        if gi > 0:
+            output.append("--")
+        for i in range(start, end):
+            line_content = truncate_line(lines[i])
+            line_num = i + 1  # 1-indexed for display
+            if i in match_idxs:
+                output.append(f"{label}:{line_num}: {line_content}")
+            else:
+                output.append(f"{label}-{line_num}- {line_content}")
+
+    return output
+
+
 # --- Main ---
 if not grep_regex:
     print("grep_regex must be non-empty.", file=sys.stderr)
@@ -155,6 +178,31 @@ except re.error as e:
     print(f"Invalid grep_regex '{grep_regex}': {e}", file=sys.stderr)
     sys.exit(1)
 
+# --- File pattern validation (mutually exclusive) ---
+if file_glob and file_regex:
+    print("Provide file_glob or file_regex, not both.", file=sys.stderr)
+    sys.exit(1)
+
+if not file_glob and not file_regex:
+    file_glob = "*"
+
+if file_glob:
+    file_pattern_rx = re.compile(
+        _glob.translate(file_glob, recursive=True, include_hidden=True, seps="/")
+    )
+    allow_hidden_files = file_glob.rsplit("/", 1)[-1].startswith(".")
+    match_basename_only = "/" not in file_glob
+else:
+    try:
+        file_pattern_rx = re.compile(file_regex)
+    except re.error as e:
+        print(f"Invalid file_regex '{file_regex}': {e}", file=sys.stderr)
+        sys.exit(1)
+    # See fs_find.py for the rationale on allow_hidden_files and
+    # match_basename_only in regex mode.
+    allow_hidden_files = False
+    match_basename_only = "/" not in file_regex
+
 exclude_re = None
 if exclude_regex:
     try:
@@ -163,17 +211,6 @@ if exclude_regex:
         print(f"Invalid exclude_regex '{exclude_regex}': {e}", file=sys.stderr)
         sys.exit(1)
 
-# Matching strategy mirrors Path.rglob() (see fs_find.py's translate_glob).
-match_basename_only = "/" not in file_glob
-file_regex = re.compile(translate_glob(file_glob))
-
-# A glob whose final segment starts with '.' explicitly targets hidden files
-# (e.g. '.env', '**/.env') — mirrors shell semantics where '*' does not match
-# a leading dot but an explicit pattern does. Hidden DIRECTORIES are still
-# pruned regardless (performance); point `path` directly at one to search
-# inside it.
-allow_hidden_files = file_glob.rsplit("/", 1)[-1].startswith(".")
-
 path = resolve_path(path_str)
 
 if not path.exists():
@@ -181,16 +218,23 @@ if not path.exists():
     sys.exit(1)
 
 matches: list[str] = []
+match_count = 0  # counts actual match lines (not context) for max_results
 skipped_hidden = 0
 skipped_excluded = 0
 skipped_binary = 0
 skipped_unreadable = 0
 truncated = False
 
-if path.is_file():
+# Resolve adaptive context_lines default: 4 for single-file, 1 for dir scan.
+is_single_file = path.is_file()
+if context_lines is not None:
+    ctx = max(0, int(context_lines))
+else:
+    ctx = 4 if is_single_file else 1
+
+if is_single_file:
     # A directly named file is always searched — bypasses hidden/exclude/glob
-    # filtering and the binary sniff. Covers grepping a partially corrupted
-    # log file, or a dotfile named explicitly.
+    # filtering and the binary sniff.
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -199,26 +243,32 @@ if path.is_file():
 
     if text is not None:
         label = display_path(path)
-        file_match_count = 0
-        for line_num, line in enumerate(text.splitlines(), start=1):
+        all_lines = text.splitlines()
+        match_line_nums: list[int] = []
+        for line_num, line in enumerate(all_lines, start=1):
             if regex.search(line):
-                matches.append(f"{label}:{line_num}: {truncate_line(line)}")
-                file_match_count += 1
-                if len(matches) >= max_results:
+                match_line_nums.append(line_num)
+                match_count += 1
+                if match_count >= max_results:
                     truncated = True
                     break
-                if max_results_per_file and file_match_count >= max_results_per_file:
+                if max_results_per_file and match_count >= max_results_per_file:
                     break
+
+        if ctx > 0:
+            matches = format_matches_with_context(all_lines, match_line_nums, label, ctx)
+        else:
+            for ln in match_line_nums:
+                matches.append(f"{label}:{ln}: {truncate_line(all_lines[ln - 1])}")
 else:
     # Single pass: walk, filter, and match together so max_results can stop
     # the walk early instead of enumerating the entire (pruned) tree first.
-    for dirpath, dirnames, filenames in os.walk(path):
+    for dirpath_str, dirnames, filenames in os.walk(path):
         if truncated:
             break
-        rel_dir = rel_posix(path, dirpath)
+        rel_dir = rel_posix(path, dirpath_str)
 
-        # Prune hidden / excluded subdirectories BEFORE os.walk descends into
-        # them — never walked, not just filtered from results.
+        # Prune hidden / excluded subdirectories BEFORE os.walk descends.
         kept_dirnames = []
         for d in dirnames:
             if is_hidden(d):
@@ -232,6 +282,8 @@ else:
         dirnames[:] = kept_dirnames
 
         for f in filenames:
+            if truncated:
+                break
             if is_hidden(f) and not allow_hidden_files:
                 skipped_hidden += 1
                 continue
@@ -240,10 +292,11 @@ else:
                 skipped_excluded += 1
                 continue
             target = f if match_basename_only else rel_file
-            if not file_regex.match(target):
+            # search, not match/fullmatch — see fs_find.py for rationale.
+            if not file_pattern_rx.search(target):
                 continue
 
-            candidate = Path(dirpath) / f
+            candidate = Path(dirpath_str) / f
             text, reason = read_text_or_skip_reason(candidate)
             if reason == "binary":
                 skipped_binary += 1
@@ -253,18 +306,27 @@ else:
                 continue
 
             label = display_path(candidate)
+            all_lines = text.splitlines()
             file_match_count = 0
-            for line_num, line in enumerate(text.splitlines(), start=1):
+            match_line_nums = []
+            for line_num, line in enumerate(all_lines, start=1):
                 if regex.search(line):
-                    matches.append(f"{label}:{line_num}: {truncate_line(line)}")
+                    match_line_nums.append(line_num)
                     file_match_count += 1
-                    if len(matches) >= max_results:
+                    match_count += 1
+                    if match_count >= max_results:
                         truncated = True
                         break
                     if max_results_per_file and file_match_count >= max_results_per_file:
                         break
-            if truncated:
-                break
+
+            if ctx > 0:
+                matches.extend(
+                    format_matches_with_context(all_lines, match_line_nums, label, ctx)
+                )
+            else:
+                for ln in match_line_nums:
+                    matches.append(f"{label}:{ln}: {truncate_line(all_lines[ln - 1])}")
 
 notes = []
 if truncated:

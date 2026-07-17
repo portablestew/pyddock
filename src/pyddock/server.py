@@ -353,25 +353,30 @@ def create_server(workspace: Path | None = None, debug: bool = False) -> FastMCP
     _fs_find_desc = (
         "Find files by name. Approximately: [p for p in os.walk(path) if file_glob matches]\n"
         "\n"
-        "file_glob is a glob (e.g. '*.py', '**/test_*.py') matched against filenames\n"
-        "under path (default: workspace root, must be a directory). Hidden\n"
-        "dot-directories are pruned before descending (an explicit leading '.' in\n"
-        "file_glob, e.g. '.env', still matches hidden files); exclude_regex\n"
-        "(optional) prunes more by relative path. Returns matching relative paths,\n"
-        "one per line, capped at max_results (default: 100)."
+        "Filenames under path (default: workspace root, must be a directory) are\n"
+        "matched against file_glob (e.g. '**/test_*.py') or file_regex\n"
+        "('test_.+\\.py'; mutually exclusive with file_glob). Hidden\n"
+        "dot-directories are pruned before descending (an explicit leading '.'\n"
+        "in file_glob, e.g. '.env', still matches hidden files); exclude_regex\n"
+        "(optional) prunes more by relative path. Returns matching relative\n"
+        "paths, one per line, capped at max_results (default: 100)."
     )
 
     @mcp.tool(name="fs_find", description=_fs_find_desc)
     async def fs_find(
-        file_glob: str,
+        file_glob: str | None = None,
+        file_regex: str | None = None,
         path: str | None = None,
         exclude_regex: str | None = None,
         max_results: int | None = None,
     ) -> str:
-        if not file_glob or not file_glob.strip():
-            return "Error: 'file_glob' is required and must be non-empty."
+        if not file_glob and not file_regex:
+            return "Error: provide either 'file_glob' or 'file_regex'."
+        if file_glob and file_regex:
+            return "Error: provide file_glob or file_regex, not both."
         return await registry.execute("fs_find", {
             "file_glob": file_glob,
+            "file_regex": file_regex,
             "path": path,
             "exclude_regex": exclude_regex,
             "max_results": max_results,
@@ -383,9 +388,12 @@ def create_server(workspace: Path | None = None, debug: bool = False) -> FastMCP
         "each matched file.\n"
         "\n"
         "grep_regex is searched within each file matched by file_glob (glob,\n"
-        "default '*') under path (default: workspace root). Returns\n"
-        "'path:line: content' per match, capped at max_results (default: 100)\n"
-        "and 300 chars per line. Optional max_results_per_file caps matches per file.\n"
+        "default '*') or file_regex (mutually exclusive) under path\n"
+        "(default: workspace root). Returns 'path:line: content' per match,\n"
+        "capped at max_results (default: 100) and 300 chars per line. Optional\n"
+        "max_results_per_file caps matches per file. context_lines controls\n"
+        "how many surrounding lines are shown around each match; set to 0 for\n"
+        "compact output.\n"
         "\n"
         "Binary files are skipped when scanning a directory path. A single named\n"
         "file is always searched."
@@ -395,20 +403,26 @@ def create_server(workspace: Path | None = None, debug: bool = False) -> FastMCP
     async def fs_grep(
         grep_regex: str,
         file_glob: str | None = None,
+        file_regex: str | None = None,
         path: str | None = None,
         exclude_regex: str | None = None,
         max_results: int | None = None,
         max_results_per_file: int | None = None,
+        context_lines: int | None = None,
     ) -> str:
         if not grep_regex:
             return "Error: 'grep_regex' is required and must be non-empty."
+        if file_glob and file_regex:
+            return "Error: provide file_glob or file_regex, not both."
         return await registry.execute("fs_grep", {
             "grep_regex": grep_regex,
             "file_glob": file_glob,
+            "file_regex": file_regex,
             "path": path,
             "exclude_regex": exclude_regex,
             "max_results": max_results,
             "max_results_per_file": max_results_per_file,
+            "context_lines": context_lines,
         })
 
     return mcp

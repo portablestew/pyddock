@@ -1,7 +1,15 @@
 """fs_find tool script.
 
-Find files by name under a directory. Approximately:
-    [p for p in os.walk(path) if file_glob matches]
+Find files by name. Approximately: [p for p in os.walk(path) if file_glob matches]
+
+file_glob is a glob (e.g. '*.py', '**/test_*.py') matched against filenames
+under path (default: workspace root, must be a directory). Alternatively,
+file_regex provides a raw regex matched the same way (mutually exclusive
+with file_glob): a pattern with no '/' matches basenames at any depth, a
+pattern containing '/' matches the full relative path. Like grep_regex/
+exclude_regex elsewhere in these tools, file_regex matches anywhere in the
+name/path (re.search), not just the whole thing — anchor with ^/$ for an
+exact match.
 
 Hidden dot-directories (and their contents) are pruned before descending —
 they are never walked, not just filtered from results — so this stays fast
@@ -13,13 +21,15 @@ match a leading dot but an explicit pattern does. Returns matching paths
 (relative to the workspace root when possible), one per line, capped at
 max_results.
 """
+import glob as _glob
 import os
 import re
 import sys
 from pathlib import Path
 
 # --- Parameters ---
-file_glob = _PARAMS["file_glob"]
+file_glob = _PARAMS.get("file_glob")
+file_regex = _PARAMS.get("file_regex")
 path_str = _PARAMS.get("path") or "."
 exclude_regex = _PARAMS.get("exclude_regex")
 max_results = _PARAMS.get("max_results") or 100
@@ -48,51 +58,6 @@ def display_path(p: Path) -> str:
         return str(p)
 
 
-def translate_glob(pattern: str) -> str:
-    """Translate a glob pattern to an anchored regex.
-
-    Supports '*' (any run of non-separator chars), '?' (one non-separator
-    char), '[seq]'/'[!seq]' character classes, and '**' as a recursive
-    any-depth-of-segments wildcard. Matched against a forward-slash path.
-    """
-    i, n = 0, len(pattern)
-    out: list[str] = []
-    while i < n:
-        c = pattern[i]
-        i += 1
-        if c == "*":
-            if i < n and pattern[i] == "*":
-                i += 1
-                if i < n and pattern[i] == "/":
-                    i += 1
-                    out.append("(?:.*/)?")
-                else:
-                    out.append(".*")
-            else:
-                out.append("[^/]*")
-        elif c == "?":
-            out.append("[^/]")
-        elif c == "[":
-            j = i
-            if j < n and pattern[j] == "!":
-                j += 1
-            if j < n and pattern[j] == "]":
-                j += 1
-            while j < n and pattern[j] != "]":
-                j += 1
-            if j >= n:
-                out.append(re.escape("["))
-            else:
-                stuff = pattern[i:j]
-                if stuff.startswith("!"):
-                    stuff = "^" + stuff[1:]
-                out.append("[" + stuff + "]")
-                i = j + 1
-        else:
-            out.append(re.escape(c))
-    return "^" + "".join(out) + "$"
-
-
 def is_hidden(name: str) -> bool:
     """True if a single path component is dot-prefixed."""
     return name.startswith(".")
@@ -106,10 +71,44 @@ def rel_posix(base: Path, dirpath: str) -> str:
     return rel.replace("\\", "/")
 
 
-# --- Main ---
-if not file_glob:
-    print("file_glob must be non-empty.", file=sys.stderr)
+# --- Input validation ---
+if file_glob and file_regex:
+    print("Provide file_glob or file_regex, not both.", file=sys.stderr)
     sys.exit(1)
+
+# Default to '*' glob when neither is specified
+if not file_glob and not file_regex:
+    file_glob = "*"
+
+# Build the compiled file-matching regex from whichever param was given.
+if file_glob:
+    # glob.translate() is the stdlib's canonical glob-to-regex translator (Python 3.13+).
+    # include_hidden=True because pyddock handles hidden-file pruning separately in the
+    # walk loop (via is_hidden()/allow_hidden_files). seps="/" because rel_posix() always
+    # produces forward-slash paths regardless of OS.
+    file_pattern_rx = re.compile(
+        _glob.translate(file_glob, recursive=True, include_hidden=True, seps="/")
+    )
+    # A glob whose final segment starts with '.' explicitly targets hidden files.
+    allow_hidden_files = file_glob.rsplit("/", 1)[-1].startswith(".")
+    # A pattern with no '/' matches basenames only; otherwise match the full relative path.
+    match_basename_only = "/" not in file_glob
+    pattern_display = file_glob
+else:
+    try:
+        file_pattern_rx = re.compile(file_regex)
+    except re.error as e:
+        print(f"Invalid file_regex '{file_regex}': {e}", file=sys.stderr)
+        sys.exit(1)
+    # Regex mode: no hidden-file allowance via pattern inspection — unlike a
+    # glob's leading '.', there's no reliable syntactic way to tell whether an
+    # arbitrary regex "means" to target a hidden file (use exclude_regex or
+    # point path at a hidden dir directly instead). Same basename-vs-full-path
+    # convention as file_glob: a pattern with no '/' matches basenames at any
+    # depth; a pattern containing '/' matches the full relative path.
+    allow_hidden_files = False
+    match_basename_only = "/" not in file_regex
+    pattern_display = file_regex
 
 exclude_re = None
 if exclude_regex:
@@ -118,19 +117,6 @@ if exclude_regex:
     except re.error as e:
         print(f"Invalid exclude_regex '{exclude_regex}': {e}", file=sys.stderr)
         sys.exit(1)
-
-# Matching strategy mirrors Path.rglob(): a pattern with no '/' matches the
-# filename at any depth; a pattern containing '/' matches the full relative
-# path from `path` (e.g. '**/test_*.py').
-match_basename_only = "/" not in file_glob
-file_regex = re.compile(translate_glob(file_glob))
-
-# A glob whose final segment starts with '.' explicitly targets hidden files
-# (e.g. '.env', '**/.env') — mirrors shell semantics where '*' does not match
-# a leading dot but an explicit pattern does. Hidden DIRECTORIES are still
-# pruned regardless (performance); point `path` directly at one to search
-# inside it.
-allow_hidden_files = file_glob.rsplit("/", 1)[-1].startswith(".")
 
 path = resolve_path(path_str)
 
@@ -176,7 +162,13 @@ for dirpath, dirnames, filenames in os.walk(path):
             skipped_excluded += 1
             continue
         target = f if match_basename_only else rel_file
-        if not file_regex.match(target):
+        # search, not match/fullmatch: glob-derived patterns are anchored on
+        # both ends by glob.translate() itself (its regex ends in \z), so
+        # search() behaves identically to fullmatch() for the file_glob case.
+        # For file_regex, search() keeps it consistent with grep_regex/
+        # exclude_regex elsewhere in these tools (substring match by default;
+        # the caller anchors with ^/$ if they want a whole-name match).
+        if not file_pattern_rx.search(target):
             continue
         results.append(Path(dirpath) / f)
         if len(results) >= max_results:
@@ -185,14 +177,15 @@ for dirpath, dirnames, filenames in os.walk(path):
 
 notes = []
 if truncated:
-    notes.append(f"Showing first {max_results} results. Narrow file_glob or path to see more.")
+    pattern_param = "file_glob" if file_glob else "file_regex"
+    notes.append(f"Showing first {max_results} results. Narrow {pattern_param} or path to see more.")
 if skipped_hidden:
     notes.append(f"{skipped_hidden} hidden file(s)/dir(s) skipped.")
 if skipped_excluded:
     notes.append(f"{skipped_excluded} excluded file(s)/dir(s) skipped.")
 
 if not results:
-    msg = f"No files matching '{file_glob}' found under '{path_str}'."
+    msg = f"No files matching '{pattern_display}' found under '{path_str}'."
     if notes:
         msg += " (" + " ".join(notes) + ")"
     print(msg)

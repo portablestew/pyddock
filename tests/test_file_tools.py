@@ -37,6 +37,7 @@ pathlib = true
 re = true
 difflib = true
 datetime = true
+glob = true
 
 [filesystem]
 writable_paths = ["."]
@@ -614,8 +615,10 @@ class TestFsGrep:
             (d / f"f{i}.txt").write_text("needle\n" * 5, encoding="utf-8")
         result = run(registry, "fs_grep", {
             "grep_regex": "needle", "path": str(d), "max_results": 3,
+            "context_lines": 0,
         })
         assert "Showing first 3 matches" in result
+        # With context_lines=0, only match lines appear (each contains "needle" once)
         assert result.count("needle") == 3
 
     def test_max_results_per_file_caps_matches_within_a_file(self, ws: Path, registry: ScriptToolRegistry):
@@ -628,7 +631,9 @@ class TestFsGrep:
 
         result = run(registry, "fs_grep", {
             "grep_regex": "needle", "path": str(ws), "max_results_per_file": 2,
+            "context_lines": 0,
         })
+        # Only match lines (context_lines=0), so count filename occurrences directly
         assert result.count("dense.txt") == 2
         assert "sparse.txt" in result
 
@@ -640,8 +645,218 @@ class TestFsGrep:
 
         result = run(registry, "fs_grep", {
             "grep_regex": "needle", "path": str(f), "max_results_per_file": 3,
+            "context_lines": 0,
         })
+        # With context_lines=0, each match line contains the filename once
         assert result.count("dense.txt") == 3
+
+    def test_file_regex_filters_files(self, ws: Path, registry: ScriptToolRegistry):
+        """file_regex as alternative to file_glob restricts which files are searched."""
+        (ws / "Server.log").write_text("needle\n", encoding="utf-8")
+        (ws / "Client.log").write_text("needle\n", encoding="utf-8")
+        (ws / "other.txt").write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "file_regex": r"(Server|Client)\.log",
+            "path": str(ws), "context_lines": 0,
+        })
+        assert "Server.log" in result
+        assert "Client.log" in result
+        assert "other.txt" not in result
+
+    def test_file_glob_and_file_regex_mutually_exclusive(self, ws: Path, registry: ScriptToolRegistry):
+        """Passing both file_glob and file_regex is an error."""
+        (ws / "a.py").write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "file_glob": "*.py",
+            "file_regex": "a", "path": str(ws),
+        })
+        assert "not both" in result.lower()
+
+    def test_grep_file_regex_with_slash_matches_full_relative_path(
+        self, ws: Path, registry: ScriptToolRegistry,
+    ):
+        """A file_regex containing '/' scopes to the full relative path,
+        mirroring file_glob's basename-vs-full-path convention."""
+        sub = ws / "sub"
+        sub.mkdir()
+        (sub / "target.py").write_text("needle\n", encoding="utf-8")
+        (ws / "target.py").write_text("needle\n", encoding="utf-8")
+
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "file_regex": r"sub/target\.py",
+            "path": str(ws), "context_lines": 0,
+        })
+        assert "sub/target.py" in result
+        assert result.count("target.py") == 1
+
+    def test_grep_file_regex_matches_as_substring(self, ws: Path, registry: ScriptToolRegistry):
+        """file_regex matches anywhere in the name (re.search), like
+        grep_regex/exclude_regex — a partial pattern missing the extension
+        still matches."""
+        (ws / "fs_find.py").write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "file_regex": r"fs_find", "path": str(ws),
+        })
+        assert "fs_find.py" in result
+
+    def test_grep_file_regex_can_be_anchored_for_exact_match(self, ws: Path, registry: ScriptToolRegistry):
+        """A caller wanting an exact-name match can anchor file_regex with ^/$."""
+        (ws / "fs_find.py").write_text("needle\n", encoding="utf-8")
+        (ws / "fs_find.pyc").write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "file_regex": r"^fs_find\.py$", "path": str(ws),
+        })
+        assert "fs_find.py:" in result
+        assert "fs_find.pyc" not in result
+
+    def test_context_lines_default_directory_scan(self, ws: Path, registry: ScriptToolRegistry):
+        """Directory scan defaults to 1 line of context around matches."""
+        f = ws / "ctx.txt"
+        f.write_text("line1\nline2\nneedle\nline4\nline5\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "needle", "path": str(ws)})
+        # Match line uses ':'
+        assert "ctx.txt:3:" in result
+        # Context lines use '-' separator and show 1 before/after
+        assert "ctx.txt-2-" in result
+        assert "ctx.txt-4-" in result
+        # Lines outside the 1-line context window should NOT appear
+        assert "ctx.txt-1-" not in result
+        assert "ctx.txt-5-" not in result
+
+    def test_context_lines_default_single_file(self, ws: Path, registry: ScriptToolRegistry):
+        """Single-file target defaults to 4 lines of context around matches."""
+        f = ws / "ctx_single.txt"
+        lines = [f"line{i}" for i in range(1, 12)]
+        lines[5] = "needle"  # line 6 (1-indexed)
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "needle", "path": str(f)})
+        # Match at line 6 with 4 context -> lines 2..10
+        assert "ctx_single.txt:6:" in result
+        assert "ctx_single.txt-2-" in result  # 4 lines before
+        assert "ctx_single.txt-10-" in result  # 4 lines after
+
+    def test_context_lines_zero_compact(self, ws: Path, registry: ScriptToolRegistry):
+        """context_lines=0 produces compact output with no context."""
+        f = ws / "compact.txt"
+        f.write_text("before\nneedle\nafter\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "path": str(ws), "context_lines": 0,
+        })
+        assert "compact.txt:2:" in result
+        # No context lines
+        assert "compact.txt-1-" not in result
+        assert "compact.txt-3-" not in result
+
+    def test_context_lines_overlap_merged(self, ws: Path, registry: ScriptToolRegistry):
+        """Adjacent matches have their context windows merged, separated by '--'
+        only between non-overlapping groups."""
+        f = ws / "overlap.txt"
+        # Matches on lines 2 and 4 (context_lines=1 -> windows [1..3] and [3..5] overlap -> merged)
+        # Match on line 9 (window [8..10]) is separated from the first group by a gap (lines 6-7)
+        content = "line1\nneedle_a\nline3\nneedle_b\nline5\nline6\nline7\nline8\nneedle_c\nline10\n"
+        f.write_text(content, encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "path": str(ws), "context_lines": 1,
+        })
+        # needle_a (line2) and needle_b (line4) overlap -> merged, no '--' between them
+        # needle_c (line9) is separated -> '--' before it
+        assert "--" in result
+        lines = result.splitlines()
+        sep_indices = [i for i, l in enumerate(lines) if l == "--"]
+        assert len(sep_indices) == 1
+
+
+# =============================================================================
+# fs_find file_regex tests
+# =============================================================================
+
+
+class TestFsFindFileRegex:
+    def test_file_regex_matches(self, ws: Path, registry: ScriptToolRegistry):
+        """file_regex matches filenames by regex."""
+        (ws / "Server.log").write_text("x", encoding="utf-8")
+        (ws / "Client.log").write_text("x", encoding="utf-8")
+        (ws / "other.txt").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {
+            "file_regex": r"(Server|Client)\.log", "path": str(ws),
+        })
+        assert "Server.log" in result
+        assert "Client.log" in result
+        assert "other.txt" not in result
+
+    def test_file_glob_and_file_regex_mutually_exclusive(self, ws: Path, registry: ScriptToolRegistry):
+        """Passing both file_glob and file_regex is an error."""
+        (ws / "a.py").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {
+            "file_glob": "*.py", "file_regex": "a", "path": str(ws),
+        })
+        assert "not both" in result.lower()
+
+    def test_invalid_file_regex(self, ws: Path, registry: ScriptToolRegistry):
+        """Invalid file_regex -> error, not a crash."""
+        (ws / "a.py").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {
+            "file_regex": "(unclosed", "path": str(ws),
+        })
+        assert "Invalid file_regex" in result
+
+    def test_find_file_regex_with_slash_matches_full_relative_path(
+        self, ws: Path, registry: ScriptToolRegistry,
+    ):
+        """A file_regex containing '/' matches the full relative path from
+        path, mirroring file_glob's basename-vs-full-path convention."""
+        sub = ws / "sub"
+        sub.mkdir()
+        (sub / "target.py").write_text("x", encoding="utf-8")
+        (ws / "target.py").write_text("x", encoding="utf-8")
+
+        # Without a slash, matches basenames at any depth -> both files.
+        result_basename = run(registry, "fs_find", {
+            "file_regex": r"target\.py", "path": str(ws),
+        })
+        assert result_basename.count("target.py") == 2
+
+        # With a slash, scopes to the full relative path -> only the nested one.
+        result_scoped = run(registry, "fs_find", {
+            "file_regex": r"sub/target\.py", "path": str(ws),
+        })
+        assert "sub/target.py" in result_scoped
+        assert result_scoped.count("target.py") == 1
+
+    def test_find_file_regex_matches_as_substring(self, ws: Path, registry: ScriptToolRegistry):
+        """file_regex matches anywhere in the name (re.search), like
+        exclude_regex — a partial pattern missing the extension still matches."""
+        (ws / "fs_find.py").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {
+            "file_regex": r"fs_find", "path": str(ws),
+        })
+        assert "fs_find.py" in result
+
+    def test_find_file_regex_can_be_anchored_for_exact_match(self, ws: Path, registry: ScriptToolRegistry):
+        """A caller wanting an exact-name match can anchor file_regex with ^/$."""
+        (ws / "fs_find.py").write_text("x", encoding="utf-8")
+        (ws / "fs_find.pyc").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {
+            "file_regex": r"^fs_find\.py$", "path": str(ws),
+        })
+        assert "fs_find.py" in result
+        assert "fs_find.pyc" not in result
+
+    def test_find_file_regex_truncation_note_names_file_regex(
+        self, ws: Path, registry: ScriptToolRegistry,
+    ):
+        """The truncation hint names the parameter actually in use — it should
+        say 'file_regex', not 'file_glob', when file_regex was the active
+        pattern (regression: the note used to hardcode 'file_glob')."""
+        d = ws / "many"
+        d.mkdir()
+        for i in range(10):
+            (d / f"f{i}.py").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {
+            "file_regex": r"\.py$", "path": str(d), "max_results": 3,
+        })
+        assert "Narrow file_regex or path" in result
+        assert "file_glob" not in result
 
 
 # =============================================================================
@@ -691,6 +906,7 @@ pathlib = true
 re = true
 difflib = true
 datetime = true
+glob = true
 
 [filesystem]
 writable_paths = ["."]
@@ -743,6 +959,7 @@ pathlib = true
 re = true
 difflib = true
 datetime = true
+glob = true
 [filesystem]
 writable_paths = ["."]
 readable_paths = ["."]
