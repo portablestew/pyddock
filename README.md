@@ -86,7 +86,7 @@ Pyddock also exposes file I/O tools that execute through the same sandbox as `ru
 - **`fs_readfile`** — Read a text file. Lines are 1-indexed; negative start = tail. Truncates large output with a continuation hint.
 - **`fs_stat`** — File metadata (exists, type, size, line count, modified). Returns `exists: false` for missing paths.
 - **`fs_find`** — Find files by name (`file_glob` match, recursive). Prunes hidden dot-directories and `exclude_regex` matches before descending (never walked, not just filtered), so large ignored trees (`.venv/`, `node_modules/`) stay fast. Returns matching relative paths, capped at `max_results`.
-- **`fs_grep`** — Search file contents by `grep_regex` (always case-insensitive). Same hidden-directory pruning and `exclude_regex` as `fs_find`. Returns `path:line: content` per match, capped at `max_results` and 300 chars per line. Skips binary files when scanning a directory; always searches a directly named file.
+- **`fs_grep`** — Search file contents by `grep_regex` (always case-insensitive). Same hidden-directory pruning and `exclude_regex` as `fs_find`. Returns `path:line: content` per match, capped at `max_results` and 300 chars per line, with an optional `max_results_per_file` cap. Skips binary files when scanning a directory; always searches a directly named file.
 - **`fs_append`** — Append to a file (creates if missing). Returns a unified diff.
 - **`fs_delete`** — Delete a file or empty directory. Returns a unified diff of removed content.
 - **`fs_str_replace`** — Find-and-replace exact text (unique match required). Returns a unified diff, or match diagnostics on failure.

@@ -618,6 +618,31 @@ class TestFsGrep:
         assert "Showing first 3 matches" in result
         assert result.count("needle") == 3
 
+    def test_max_results_per_file_caps_matches_within_a_file(self, ws: Path, registry: ScriptToolRegistry):
+        """max_results_per_file limits matches contributed by a single file
+        during a directory scan, preserving breadth across other files."""
+        dense = ws / "dense.txt"
+        dense.write_text("needle\n" * 10, encoding="utf-8")
+        sparse = ws / "sparse.txt"
+        sparse.write_text("needle\n", encoding="utf-8")
+
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "path": str(ws), "max_results_per_file": 2,
+        })
+        assert result.count("dense.txt") == 2
+        assert "sparse.txt" in result
+
+    def test_max_results_per_file_applies_to_directly_named_file(self, ws: Path, registry: ScriptToolRegistry):
+        """max_results_per_file also caps matches when path names a single
+        file directly, not just during a directory walk."""
+        f = ws / "dense.txt"
+        f.write_text("needle\n" * 10, encoding="utf-8")
+
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "path": str(f), "max_results_per_file": 3,
+        })
+        assert result.count("dense.txt") == 3
+
 
 # =============================================================================
 # Sandbox enforcement tests

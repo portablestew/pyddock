@@ -385,7 +385,7 @@ def create_server(workspace: Path | None = None, debug: bool = False) -> FastMCP
         "grep_regex is searched within each file matched by file_glob (glob,\n"
         "default '*') under path (default: workspace root). Returns\n"
         "'path:line: content' per match, capped at max_results (default: 100)\n"
-        "and 300 chars per line.\n"
+        "and 300 chars per line. Optional max_results_per_file caps matches per file.\n"
         "\n"
         "Binary files are skipped when scanning a directory path. A single named\n"
         "file is always searched."
@@ -398,6 +398,7 @@ def create_server(workspace: Path | None = None, debug: bool = False) -> FastMCP
         path: str | None = None,
         exclude_regex: str | None = None,
         max_results: int | None = None,
+        max_results_per_file: int | None = None,
     ) -> str:
         if not grep_regex:
             return "Error: 'grep_regex' is required and must be non-empty."
@@ -407,6 +408,7 @@ def create_server(workspace: Path | None = None, debug: bool = False) -> FastMCP
             "path": path,
             "exclude_regex": exclude_regex,
             "max_results": max_results,
+            "max_results_per_file": max_results_per_file,
         })
 
     return mcp

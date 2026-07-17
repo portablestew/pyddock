@@ -13,6 +13,8 @@ where '*' does not match a leading dot but an explicit pattern does.
 Binary files are skipped when scanning a directory path (sniffed from the
 same read used for matching — no separate open). A single named file is
 always searched, binary or not.
+
+max_results_per_file (optional) caps matches per individual file.
 """
 import os
 import re
@@ -25,6 +27,7 @@ file_glob = _PARAMS.get("file_glob") or "*"
 path_str = _PARAMS.get("path") or "."
 exclude_regex = _PARAMS.get("exclude_regex")
 max_results = _PARAMS.get("max_results") or 100
+max_results_per_file = _PARAMS.get("max_results_per_file")
 workspace_root = _PARAMS["workspace_root"]
 
 # --- Constants ---
@@ -196,11 +199,15 @@ if path.is_file():
 
     if text is not None:
         label = display_path(path)
+        file_match_count = 0
         for line_num, line in enumerate(text.splitlines(), start=1):
             if regex.search(line):
                 matches.append(f"{label}:{line_num}: {truncate_line(line)}")
+                file_match_count += 1
                 if len(matches) >= max_results:
                     truncated = True
+                    break
+                if max_results_per_file and file_match_count >= max_results_per_file:
                     break
 else:
     # Single pass: walk, filter, and match together so max_results can stop
@@ -246,18 +253,25 @@ else:
                 continue
 
             label = display_path(candidate)
+            file_match_count = 0
             for line_num, line in enumerate(text.splitlines(), start=1):
                 if regex.search(line):
                     matches.append(f"{label}:{line_num}: {truncate_line(line)}")
+                    file_match_count += 1
                     if len(matches) >= max_results:
                         truncated = True
+                        break
+                    if max_results_per_file and file_match_count >= max_results_per_file:
                         break
             if truncated:
                 break
 
 notes = []
 if truncated:
-    notes.append(f"Showing first {max_results} matches. Narrow grep_regex or path to see more.")
+    notes.append(
+        f"Showing first {max_results} matches. To see more: narrow path, "
+        f"grep_regex, or set max_results_per_file."
+    )
 if skipped_binary:
     notes.append(f"{skipped_binary} binary file(s) skipped.")
 if skipped_unreadable:
