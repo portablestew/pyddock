@@ -355,6 +355,271 @@ class TestFsStat:
 
 
 # =============================================================================
+# fs_find tests
+# =============================================================================
+
+
+class TestFsFind:
+    def test_finds_matching_files(self, ws: Path, registry: ScriptToolRegistry):
+        """Glob pattern matches files recursively under path."""
+        (ws / "a.py").write_text("x = 1", encoding="utf-8")
+        (ws / "sub").mkdir()
+        (ws / "sub" / "b.py").write_text("y = 2", encoding="utf-8")
+        (ws / "c.txt").write_text("not python", encoding="utf-8")
+
+        result = run(registry, "fs_find", {"file_glob": "*.py", "path": str(ws)})
+        assert "a.py" in result
+        assert "b.py" in result
+        assert "c.txt" not in result
+
+    def test_no_matches(self, ws: Path, registry: ScriptToolRegistry):
+        """No matching files -> friendly message, not an error."""
+        (ws / "a.txt").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {"file_glob": "*.java", "path": str(ws)})
+        assert "No files matching" in result
+
+    def test_path_must_be_a_directory(self, ws: Path, registry: ScriptToolRegistry):
+        """path pointing at a file (not a directory) -> error."""
+        f = ws / "target.py"
+        f.write_text("x = 1", encoding="utf-8")
+        result = run(registry, "fs_find", {"file_glob": "*.py", "path": str(f)})
+        assert "not a directory" in result.lower()
+
+    def test_max_results_truncates(self, ws: Path, registry: ScriptToolRegistry):
+        """More matches than max_results -> truncation hint shown."""
+        d = ws / "many"
+        d.mkdir()
+        for i in range(10):
+            (d / f"f{i}.py").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {
+            "file_glob": "*.py", "path": str(d), "max_results": 3,
+        })
+        assert "Showing first 3 results" in result
+
+    def test_nonexistent_path(self, ws: Path, registry: ScriptToolRegistry):
+        """Non-existent path -> error."""
+        result = run(registry, "fs_find", {
+            "file_glob": "*.py", "path": str(ws / "nope"),
+        })
+        assert "not found" in result.lower()
+
+    def test_hidden_directory_pruned(self, ws: Path, registry: ScriptToolRegistry):
+        """Files under a dot-prefixed directory are not returned, and noted."""
+        (ws / "visible.py").write_text("x = 1", encoding="utf-8")
+        hidden_dir = ws / ".venv"
+        hidden_dir.mkdir()
+        (hidden_dir / "lib.py").write_text("y = 2", encoding="utf-8")
+
+        result = run(registry, "fs_find", {"file_glob": "*.py", "path": str(ws)})
+        assert "visible.py" in result
+        assert "lib.py" not in result
+        assert "hidden" in result.lower()
+
+    def test_hidden_file_pruned_by_wildcard_glob(self, ws: Path, registry: ScriptToolRegistry):
+        """A '*' glob does not match a dot-prefixed file, mirroring shell semantics."""
+        (ws / ".hidden.py").write_text("x = 1", encoding="utf-8")
+        result = run(registry, "fs_find", {"file_glob": "*.py", "path": str(ws)})
+        assert "No files matching" in result
+
+    def test_explicit_dot_glob_matches_hidden_file(self, ws: Path, registry: ScriptToolRegistry):
+        """A glob whose final segment starts with '.' (e.g. '.env') explicitly
+        matches hidden files, mirroring shell glob semantics."""
+        (ws / ".env").write_text("SECRET=1", encoding="utf-8")
+        (ws / "visible.txt").write_text("x", encoding="utf-8")
+        result = run(registry, "fs_find", {"file_glob": ".env", "path": str(ws)})
+        assert ".env" in result
+        assert "visible.txt" not in result
+
+    def test_explicit_dot_glob_does_not_reach_into_hidden_directories(
+        self, ws: Path, registry: ScriptToolRegistry,
+    ):
+        """An explicit dot-glob still doesn't defeat hidden-DIRECTORY pruning —
+        only the performance-motivated directory prune is unconditional."""
+        hidden_dir = ws / ".venv"
+        hidden_dir.mkdir()
+        (hidden_dir / ".env").write_text("SECRET=1", encoding="utf-8")
+        result = run(registry, "fs_find", {"file_glob": "**/.env", "path": str(ws)})
+        assert "No files matching" in result
+
+    def test_exclude_regex_prunes_directory(self, ws: Path, registry: ScriptToolRegistry):
+        """exclude_regex matching a subdirectory name prunes it (and is noted)."""
+        (ws / "visible.py").write_text("x = 1", encoding="utf-8")
+        excluded_dir = ws / "node_modules"
+        excluded_dir.mkdir()
+        (excluded_dir / "lib.py").write_text("y = 2", encoding="utf-8")
+
+        result = run(registry, "fs_find", {
+            "file_glob": "*.py", "path": str(ws), "exclude_regex": "node_modules",
+        })
+        assert "visible.py" in result
+        assert "lib.py" not in result
+        assert "excluded" in result.lower()
+
+    def test_hidden_path_named_directly_is_searched(self, ws: Path, registry: ScriptToolRegistry):
+        """Pointing path directly at a hidden directory still searches it."""
+        hidden_dir = ws / ".config"
+        hidden_dir.mkdir()
+        (hidden_dir / "settings.py").write_text("x = 1", encoding="utf-8")
+
+        result = run(registry, "fs_find", {"file_glob": "*.py", "path": str(hidden_dir)})
+        assert "settings.py" in result
+
+
+# =============================================================================
+# fs_grep tests
+# =============================================================================
+
+
+class TestFsGrep:
+    def test_finds_matches_with_line_numbers(self, ws: Path, registry: ScriptToolRegistry):
+        """Regex match reports path:line: content."""
+        f = ws / "code.py"
+        f.write_text("def hello():\n    return 'world'\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "return", "path": str(ws)})
+        assert "code.py:2:" in result
+        assert "return 'world'" in result
+
+    def test_no_matches(self, ws: Path, registry: ScriptToolRegistry):
+        """No matches -> friendly message."""
+        f = ws / "code.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "nomatch_xyz", "path": str(ws)})
+        assert "No matches" in result
+
+    def test_always_case_insensitive(self, ws: Path, registry: ScriptToolRegistry):
+        """Matching is always case-insensitive, no ignore_case param needed."""
+        f = ws / "code.py"
+        f.write_text("HELLO world\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "hello", "path": str(ws)})
+        assert "HELLO world" in result
+
+    def test_file_glob_filters_files(self, ws: Path, registry: ScriptToolRegistry):
+        """file_glob restricts which files are searched."""
+        (ws / "a.py").write_text("needle\n", encoding="utf-8")
+        (ws / "b.txt").write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "file_glob": "*.py", "path": str(ws),
+        })
+        assert "a.py" in result
+        assert "b.txt" not in result
+
+    def test_skips_binary_files_in_directory_scan(self, ws: Path, registry: ScriptToolRegistry):
+        """Binary file is skipped and noted when scanning a directory."""
+        (ws / "bin.dat").write_bytes(b"\x00\x01needle\x00\x02")
+        (ws / "text.txt").write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "needle", "path": str(ws)})
+        assert "text.txt" in result
+        assert "bin.dat" not in result
+        assert "binary file" in result.lower()
+
+    def test_always_searches_directly_named_binary_file(self, ws: Path, registry: ScriptToolRegistry):
+        """path pointing directly at a file with null bytes is still searched
+        (decode errors replaced), covering a partially corrupted log file."""
+        f = ws / "corrupt.log"
+        f.write_bytes(b"line one\nneedle in \xff\xfe corrupted line\x00\nline three\n")
+        result = run(registry, "fs_grep", {"grep_regex": "needle", "path": str(f)})
+        assert "needle" in result
+
+    def test_max_results_truncates(self, ws: Path, registry: ScriptToolRegistry):
+        """More matches than max_results -> truncation hint shown."""
+        f = ws / "many.txt"
+        f.write_text("\n".join("needle" for _ in range(10)) + "\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "path": str(ws), "max_results": 3,
+        })
+        assert "Showing first 3 matches" in result
+
+    def test_long_line_truncated(self, ws: Path, registry: ScriptToolRegistry):
+        """A matched line longer than the per-line cap is truncated with a marker."""
+        f = ws / "long.txt"
+        long_line = "needle " + ("x" * 500)
+        f.write_text(long_line + "\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "needle", "path": str(ws)})
+        assert "[truncated: line too long]" in result
+        assert "x" * 500 not in result
+
+    def test_invalid_regex(self, ws: Path, registry: ScriptToolRegistry):
+        """Invalid regex -> error, not a crash."""
+        f = ws / "code.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "(unclosed", "path": str(ws)})
+        assert "Invalid grep_regex" in result
+
+    def test_nonexistent_path(self, ws: Path, registry: ScriptToolRegistry):
+        """Non-existent path -> error."""
+        result = run(registry, "fs_grep", {
+            "grep_regex": "x", "path": str(ws / "nope"),
+        })
+        assert "not found" in result.lower()
+
+    def test_grep_hidden_directory_pruned(self, ws: Path, registry: ScriptToolRegistry):
+        """Matches under a dot-prefixed directory are excluded, and noted."""
+        (ws / "visible.py").write_text("needle\n", encoding="utf-8")
+        hidden_dir = ws / ".venv"
+        hidden_dir.mkdir()
+        (hidden_dir / "lib.py").write_text("needle\n", encoding="utf-8")
+
+        result = run(registry, "fs_grep", {"grep_regex": "needle", "path": str(ws)})
+        assert "visible.py" in result
+        assert "lib.py" not in result
+        assert "hidden" in result.lower()
+
+    def test_grep_exclude_regex_prunes_directory(self, ws: Path, registry: ScriptToolRegistry):
+        """exclude_regex matching a subdirectory name prunes it (and is noted)."""
+        (ws / "visible.py").write_text("needle\n", encoding="utf-8")
+        excluded_dir = ws / "node_modules"
+        excluded_dir.mkdir()
+        (excluded_dir / "lib.py").write_text("needle\n", encoding="utf-8")
+
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "path": str(ws), "exclude_regex": "node_modules",
+        })
+        assert "visible.py" in result
+        assert "lib.py" not in result
+        assert "excluded" in result.lower()
+
+    def test_invalid_exclude_regex(self, ws: Path, registry: ScriptToolRegistry):
+        """Invalid exclude_regex -> error, not a crash."""
+        f = ws / "code.py"
+        f.write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "path": str(ws), "exclude_regex": "(unclosed",
+        })
+        assert "Invalid exclude_regex" in result
+
+    def test_hidden_file_pruned_by_wildcard_glob(self, ws: Path, registry: ScriptToolRegistry):
+        """A '*' file_glob does not match a dot-prefixed file, mirroring shell semantics."""
+        (ws / ".env").write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {"grep_regex": "needle", "path": str(ws)})
+        assert "No matches" in result
+
+    def test_explicit_dot_glob_matches_hidden_file(self, ws: Path, registry: ScriptToolRegistry):
+        """A file_glob whose final segment starts with '.' (e.g. '.env')
+        explicitly matches hidden files despite the default pruning."""
+        (ws / ".env").write_text("needle\n", encoding="utf-8")
+        (ws / "visible.txt").write_text("needle\n", encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "file_glob": ".env", "path": str(ws),
+        })
+        assert ".env:1:" in result
+        assert "visible.txt" not in result
+
+    def test_max_results_stops_walk_early(self, ws: Path, registry: ScriptToolRegistry):
+        """max_results is enforced during the walk (single pass), not just
+        after enumerating every candidate file — verified indirectly via the
+        truncation note still firing correctly with many candidate files."""
+        d = ws / "many"
+        d.mkdir()
+        for i in range(20):
+            (d / f"f{i}.txt").write_text("needle\n" * 5, encoding="utf-8")
+        result = run(registry, "fs_grep", {
+            "grep_regex": "needle", "path": str(d), "max_results": 3,
+        })
+        assert "Showing first 3 matches" in result
+        assert result.count("needle") == 3
+
+
+# =============================================================================
 # Sandbox enforcement tests
 # =============================================================================
 
@@ -366,6 +631,71 @@ class TestSandboxEnforcement:
         result = run(registry, "fs_append", {"path": str(target), "content": "hack"})
         assert not target.exists()
         assert "permission" in result.lower() or ".pyddock" in result.lower()
+
+    def test_home_tilde_expansion(self, ws: Path, registry: ScriptToolRegistry, monkeypatch: pytest.MonkeyPatch):
+        """A leading '~' in path is expanded to the home directory, matching
+        the '~' syntax documented for [filesystem] writable_paths/readable_paths."""
+        monkeypatch.setenv("USERPROFILE", str(ws))  # Windows
+        monkeypatch.setenv("HOME", str(ws))  # POSIX
+        f = ws / "tilde_target.txt"
+        f.write_text("hello from home\n", encoding="utf-8")
+        result = run(registry, "read_file", {"path": "~/tilde_target.txt"})
+        assert "hello from home" in result
+
+    def test_fs_grep_reports_permission_denied_not_silent(
+        self, tmp_path: Path,
+    ):
+        """A file blocked by a [filesystem.guards] deny-agent rule must be
+        reported as skipped/unreadable, not silently absent from results as
+        if it simply didn't match (which would look identical to 'no matches
+        found' and mask a security-relevant rejection)."""
+        ws = tmp_path / "guarded_ws"
+        ws.mkdir()
+        config_dir = ws / ".pyddock"
+        config_dir.mkdir()
+        (config_dir / "pyddock.toml").write_text(
+            """
+[execution]
+timeout = 30
+max_timeout = 60
+
+[imports]
+os = true
+sys = true
+pathlib = true
+re = true
+difflib = true
+datetime = true
+
+[filesystem]
+writable_paths = ["."]
+readable_paths = ["*"]
+
+[filesystem.guards]
+'/secret/' = "deny-agent"
+
+[ast]
+block_calls = ["eval", "exec", "compile", "breakpoint", "__import__"]
+block_attributes = []
+
+[audit]
+"open" = "fs"
+""",
+            encoding="utf-8",
+        )
+        config = load_config(ws)
+        vm = VenvManager(venv_path=ws / ".pyddock" / "venv", allowed_imports=config.imports.allowed)
+        vm.ensure_venv()
+        executor = SubprocessExecutor(config, vm)
+        reg = ScriptToolRegistry(config, executor, ws)
+        reg.load_scripts()
+
+        guarded_dir = ws / "secret"
+        guarded_dir.mkdir()
+        (guarded_dir / "creds.txt").write_text("needle\n", encoding="utf-8")
+
+        result = run(reg, "fs_grep", {"grep_regex": "needle", "path": str(guarded_dir)})
+        assert "unreadable" in result.lower() or "permission" in result.lower()
 
     def test_read_outside_restricted_readable(self, tmp_path: Path):
         """Read outside workspace with readable_paths=['.'] → blocked."""

@@ -14,11 +14,16 @@ workspace_root = _PARAMS["workspace_root"]
 
 
 def resolve_path(raw_path: str) -> Path:
-    """Resolve a user-provided path to absolute, relative to workspace root."""
-    p = Path(raw_path)
+    """Resolve a user-provided path to absolute, relative to workspace root.
+
+    Expands a leading '~' (home directory) before resolving, mirroring how
+    [filesystem] scope paths (writable_paths/readable_paths) are resolved.
+    """
+    expanded = os.path.expanduser(raw_path)
+    p = Path(expanded)
     if p.is_absolute():
         return Path(os.path.abspath(str(p)))
-    return Path(os.path.abspath(str(Path(workspace_root) / raw_path)))
+    return Path(os.path.abspath(str(Path(workspace_root) / expanded)))
 
 
 # --- Main ---

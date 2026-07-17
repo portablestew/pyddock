@@ -350,6 +350,65 @@ def create_server(workspace: Path | None = None, debug: bool = False) -> FastMCP
             "end_line": end_line,
         })
 
+    _fs_find_desc = (
+        "Find files by name. Approximately: [p for p in os.walk(path) if file_glob matches]\n"
+        "\n"
+        "file_glob is a glob (e.g. '*.py', '**/test_*.py') matched against filenames\n"
+        "under path (default: workspace root, must be a directory). Hidden\n"
+        "dot-directories are pruned before descending (an explicit leading '.' in\n"
+        "file_glob, e.g. '.env', still matches hidden files); exclude_regex\n"
+        "(optional) prunes more by relative path. Returns matching relative paths,\n"
+        "one per line, capped at max_results (default: 100)."
+    )
+
+    @mcp.tool(name="fs_find", description=_fs_find_desc)
+    async def fs_find(
+        file_glob: str,
+        path: str | None = None,
+        exclude_regex: str | None = None,
+        max_results: int | None = None,
+    ) -> str:
+        if not file_glob or not file_glob.strip():
+            return "Error: 'file_glob' is required and must be non-empty."
+        return await registry.execute("fs_find", {
+            "file_glob": file_glob,
+            "path": path,
+            "exclude_regex": exclude_regex,
+            "max_results": max_results,
+        })
+
+    _fs_grep_desc = (
+        "Search file contents by regex (always case-insensitive). Approximately:\n"
+        "fs_find() then re.search(grep_regex, line, re.IGNORECASE) per line of\n"
+        "each matched file.\n"
+        "\n"
+        "grep_regex is searched within each file matched by file_glob (glob,\n"
+        "default '*') under path (default: workspace root). Returns\n"
+        "'path:line: content' per match, capped at max_results (default: 100)\n"
+        "and 300 chars per line.\n"
+        "\n"
+        "Binary files are skipped when scanning a directory path. A single named\n"
+        "file is always searched."
+    )
+
+    @mcp.tool(name="fs_grep", description=_fs_grep_desc)
+    async def fs_grep(
+        grep_regex: str,
+        file_glob: str | None = None,
+        path: str | None = None,
+        exclude_regex: str | None = None,
+        max_results: int | None = None,
+    ) -> str:
+        if not grep_regex:
+            return "Error: 'grep_regex' is required and must be non-empty."
+        return await registry.execute("fs_grep", {
+            "grep_regex": grep_regex,
+            "file_glob": file_glob,
+            "path": path,
+            "exclude_regex": exclude_regex,
+            "max_results": max_results,
+        })
+
     return mcp
 
 
